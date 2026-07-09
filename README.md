@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./logo.svg" alt="QXChat.ts logo" width="180" />
+  <img src="./logo.svg" alt="QXChat.ts logo" width="280" />
   <h3>Type-safe QXChat Selfbot for Bun</h3>
 
   <p>
