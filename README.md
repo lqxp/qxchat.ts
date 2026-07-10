@@ -41,28 +41,32 @@ bun add qxchat.ts
 
 ## Benchmarks
 
-This library is designed for low overhead. Below are the execution benchmarks conducted natively under Bun:
+This library is designed for low overhead and near-zero latency. Below are the execution benchmarks conducted natively under Bun (tested using a real connection to the QXChat production server):
 
-*Last Benchmarked: July 9, 2026*
+*Last Benchmarked: July 10, 2026*
 
-| Task | Iterations | Time Spent (ms) | Overhead per Unit |
+| Benchmark | Type | Metric / Operations | Duration (ms) |
 | :--- | :---: | :---: | :---: |
-| **Builder Instantiation** | 50,000 | **~17.5 ms** | **0.0003 ms** |
-| **AES-GCM E2EE Encryption** | 10,000 | **~564.7 ms** | **0.056 ms** |
+| **REST Auth Token Fetch** | HTTP REST | Get session token | **~316.9 ms** |
+| **Gateway WS Connect & Identify** | WebSocket | Established and ready | **~507.0 ms** |
+| **REST Profile Self-Fetch** | HTTP REST | Refresh user session `/me` | **~195.0 ms** |
+| **Gateway Room Join** | WebSocket | Join room by token | **~0.37 ms** |
+| **RTT E2EE Message (Send & Echo)** | WebSocket / Crypto | local encrypt ➔ send ➔ server echo ➔ receive ➔ local decrypt | **~197.6 ms** |
+| **AES-GCM Encryption (CPU Local)** | Cryptography | 10,000 local encryptions | **~443.0 ms** (0.044 ms/op) |
 
 > [!TIP]
-> **Zero Validation Overhead:** Thanks to TypeScript brand typing, payload constraints validation is completed during compile time, allowing builder instantiation to run in under `0.0003 ms` at runtime.
+> **Key Caching & Native DNS Pre-warming:** Thanks to Web Crypto key caching and native Bun DNS prefetching, the room joining takes under `0.4 ms` and the E2EE messaging RTT is under `200 ms`.
 
 ---
 
 ## Quick Example
 
 ```ts
-import { SelfbotClient, MessageBuilder } from 'qxchat.ts';
+import { SelfbotClient, MessageBuilder, Events } from 'qxchat.ts';
 
 const client = new SelfbotClient();
 
-client.on('ready', async () => {
+client.on(Events.Ready, async () => {
   console.log(`Connected as ${client.username}!`);
 
   const roomToken = '3f9ade207e2c5dbf58f1c91533ecac7b1dc5ba6066cc07951f9c5fcc5d9fa98c';
@@ -76,7 +80,7 @@ client.on('ready', async () => {
   await client.sendMessage(roomId, msg);
 });
 
-client.on('message', (msg) => {
+client.on(Events.MessageCreate, (msg) => {
   if (msg.username !== client.username) {
     console.log(`[${msg.username}]: ${msg.text}`);
     

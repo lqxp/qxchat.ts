@@ -123,6 +123,24 @@ export interface ClientOptions {
   maxReconnectDelay?: number;
 }
 
+export enum Events {
+  Ready = 'ready',
+  MessageCreate = 'message',
+  MessageUpdate = 'messageUpdate',
+  MessageDelete = 'messageDelete',
+  RoomMessagesClear = 'roomMessagesClear',
+  RoomUpdate = 'roomUpdate',
+  MessageReactionUpdate = 'messageReactionUpdate',
+  TypingStart = 'typingStart',
+  TypingEnd = 'typingEnd',
+  PresenceUpdate = 'presenceUpdate',
+  UserJoin = 'userJoin',
+  UserLeave = 'userLeave',
+  ProfileUpdate = 'profileUpdate',
+  Error = 'error',
+  Disconnect = 'disconnect',
+}
+
 /** Events mapping for the SelfbotClient. */
 export interface ClientEvents {
   ready: (client: SelfbotClient) => void;

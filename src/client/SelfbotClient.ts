@@ -2,7 +2,7 @@ import { OpCode, PresenceStatus, MessageKind, ProfileImageKind, ClientPlatform, 
 import { Room } from '@client/Room';
 import { Message } from '@client/Message';
 import { sanitizeAndValidateUsername, validateRoomId, validateRoomTitle, validateRoomNote } from '@errors';
-import { parseRoomAccessToken, generateRoomAccessToken } from '@crypto';
+import { parseRoomAccessToken, generateRoomAccessToken, encryptRoomPayload, decryptRoomPayload } from '@crypto';
 import { MessageBuilder, ProfileBuilder, RoomBuilder } from '@builders';
 
 class TypedEventEmitter<Events extends Record<keyof Events, (...args: never[]) => unknown>> {
@@ -139,6 +139,16 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       minReconnectDelay: options.minReconnectDelay || 1000,
       maxReconnectDelay: options.maxReconnectDelay || 30000,
     };
+    this._dnsPrefetch();
+  }
+
+  private _dnsPrefetch(): void {
+    try {
+      const hostingSource = new URL(this.options.wsUrl).hostname;
+      if (typeof Bun !== 'undefined' && Bun.dns && typeof Bun.dns.prefetch === 'function') {
+        Bun.dns.prefetch(hostingSource);
+      }
+    } catch {}
   }
 
   /**
@@ -187,7 +197,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     this.username = cleanUsername;
     this.authToken = activeToken;
     this._manualClose = false;
-
+    this._dnsPrefetch();
     this._connect();
   }
 
@@ -631,7 +641,6 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     }
 
     try {
-      const { decryptRoomPayload } = await import('../crypto/e2ee');
       const decrypted = (await decryptRoomPayload(roomKey, roomId, envelope)) as { text?: string; attachment?: APIAttachment | null };
       return this._normalizeMessageRaw({
         ...rawMessage,
@@ -770,7 +779,6 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     const key = this.roomKeys.get(cleanRoomId);
 
     if (key) {
-      const { encryptRoomPayload } = await import('@crypto');
       const encrypted = await encryptRoomPayload(key, cleanRoomId, { text: content, attachment: null });
       this._send(OpCode.EditMessage, {
         messageId,

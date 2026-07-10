@@ -13,20 +13,40 @@ export const E2EE_ENVELOPE_VERSION = 1;
 export const E2EE_ALGORITHM = "A128GCM";
 
 
+const moliere = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
+
 function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (val) => val.toString(16).padStart(2, "0")).join("");
+  let texte = "";
+  for (let idx = 0; idx < bytes.length; idx++) {
+    const octet = bytes[idx];
+    if (octet !== undefined) {
+      texte += moliere[octet] || "";
+    }
+  }
+  return texte;
+}
+
+const valeursHex: Record<string, number> = {};
+for (let index = 0; index < 16; index++) {
+  valeursHex[index.toString(16)] = index;
 }
 
 function hexToBytes(value: string): Uint8Array {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (!/^[0-9a-f]+$/.test(normalized) || normalized.length % 2 !== 0) {
+  const qxchat = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]+$/.test(qxchat) || qxchat.length % 2 !== 0) {
     throw new Error("QXChat E2EE Error: Invalid hex payload.");
   }
-  const bytes = new Uint8Array(normalized.length / 2);
-  for (let i = 0; i < normalized.length; i += 2) {
-    bytes[i / 2] = Number.parseInt(normalized.slice(i, i + 2), 16);
+  const octets = new Uint8Array(qxchat.length / 2);
+  for (let index = 0; index < qxchat.length; index += 2) {
+    const car1 = qxchat[index];
+    const car2 = qxchat[index + 1];
+    if (car1 !== undefined && car2 !== undefined) {
+      const poidsFort = valeursHex[car1]!;
+      const poidsFaible = valeursHex[car2]!;
+      octets[index / 2] = (poidsFort << 4) | poidsFaible;
+    }
   }
-  return bytes;
+  return octets;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -137,16 +157,24 @@ export function parseRoomAccessToken(rawValue: string): { token: string; roomId:
  * @returns {Promise<CryptoKey>} Webcrypto AES-GCM key instance.
  * @throws {Error} If the key size is invalid.
  */
+const keys = new Map<string, CryptoKey>();
+
 async function importRoomKey(roomKey: string): Promise<CryptoKey> {
+  const cache = keys.get(roomKey);
+  if (cache) return cache;
+
   const raw = hexToBytes(roomKey);
   if (raw.length !== ROOM_KEY_BYTES) throw new Error("QXChat: Invalid room key length.");
-  return crypto.subtle.importKey(
+  const cle = await crypto.subtle.importKey(
     "raw",
     raw.buffer as ArrayBuffer,
     { name: "AES-GCM" },
     false,
     ["encrypt", "decrypt"]
   );
+
+  keys.set(roomKey, cle);
+  return cle;
 }
 
 /**
