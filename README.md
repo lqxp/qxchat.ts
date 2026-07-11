@@ -43,16 +43,16 @@ bun add qxchat.ts
 
 This library is designed for low overhead and near-zero latency. Below are the execution benchmarks conducted natively under Bun (tested using a real connection to the QXChat production server):
 
-*Last Benchmarked: July 10, 2026*
+*Last Benchmarked: July 11, 2026*
 
 | Benchmark | Type | Metric / Operations | Duration (ms) |
 | :--- | :---: | :---: | :---: |
-| **REST Auth Token Fetch** | HTTP REST | Get session token | **~316.9 ms** |
-| **Gateway WS Connect & Identify** | WebSocket | Established and ready | **~507.0 ms** |
-| **REST Profile Self-Fetch** | HTTP REST | Refresh user session `/me` | **~195.0 ms** |
-| **Gateway Room Join** | WebSocket | Join room by token | **~0.37 ms** |
-| **RTT E2EE Message (Send & Echo)** | WebSocket / Crypto | local encrypt ➔ send ➔ server echo ➔ receive ➔ local decrypt | **~197.6 ms** |
-| **AES-GCM Encryption (CPU Local)** | Cryptography | 10,000 local encryptions | **~443.0 ms** (0.044 ms/op) |
+| **REST Auth Token Fetch** | HTTP REST | Get session token | **~315.7 ms** |
+| **Gateway WS Connect & Identify** | WebSocket | Established and ready | **~533.1 ms** |
+| **REST Profile Self-Fetch** | HTTP REST | Refresh user session `/me` | **~205.6 ms** |
+| **Gateway Room Join** | WebSocket | Join room by token | **~0.33 ms** |
+| **RTT E2EE Message (Send & Echo)** | WebSocket / Crypto | local encrypt ➔ send ➔ server echo ➔ receive ➔ local decrypt | **~263.6 ms** |
+| **AES-GCM Encryption (CPU Local)** | Cryptography | 10,000 local encryptions | **~1002.3 ms** (0.100 ms/op) |
 
 > [!TIP]
 > **Key Caching & Native DNS Pre-warming:** Thanks to Web Crypto key caching and native Bun DNS prefetching, the room joining takes under `0.4 ms` and the E2EE messaging RTT is under `200 ms`.
