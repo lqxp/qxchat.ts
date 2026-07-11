@@ -1,5 +1,5 @@
 import { validateRoomId, type RoomId } from '@errors';
-import type { EncryptedEnvelope } from '@types';
+import type { EncryptedEnvelope, JsonWebKey } from '@types';
 
 const ROOM_ID_BYTES = 16;
 const ROOM_KEY_BYTES = 32;
@@ -173,6 +173,60 @@ async function deriveMessageKey(roomKey: string, roomId: string, salt: Uint8Arra
   );
 }
 
+async function importDevicePrivateKey(privateKey: JsonWebKey): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "jwk",
+    privateKey,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"]
+  );
+}
+
+async function importDevicePublicKey(publicKey: JsonWebKey): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "jwk",
+    publicKey,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["verify"]
+  );
+}
+
+function signingPayload(envelope: any): Uint8Array {
+  return TEXT_ENCODER.encode(JSON.stringify({
+    v: envelope.v,
+    alg: envelope.alg,
+    roomId: envelope.roomId,
+    n: envelope.n,
+    salt: envelope.salt,
+    iv: envelope.iv,
+    ciphertext: envelope.ciphertext,
+    senderDeviceId: envelope.senderDeviceId,
+    senderSigningKey: envelope.senderSigningKey
+  }));
+}
+
+let activeSigner: { deviceId: string; publicKey: JsonWebKey; privateKey: JsonWebKey } | null = null;
+
+async function getSigner() {
+  if (!activeSigner) {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const deviceId = bytesToHex(bytes);
+
+    const keyPair = await crypto.subtle.generateKey(
+      { name: "ECDSA", namedCurve: "P-256" },
+      true,
+      ["sign", "verify"]
+    );
+    const publicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+    const privateKey = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
+    activeSigner = { deviceId, publicKey, privateKey };
+  }
+  return activeSigner;
+}
+
 /**
  * Checks if a value conforms to the EncryptedEnvelope interface.
  * 
@@ -189,12 +243,17 @@ export function isEncryptedEnvelope(value: unknown): value is EncryptedEnvelope 
     && 'salt' in value
     && 'n' in value
     && 'ciphertext' in value
+    && 'senderDeviceId' in value
+    && 'senderSigningKey' in value
+    && 'signature' in value
     && Number((value as Record<string, unknown>).v) === E2EE_ENVELOPE_VERSION
     && String((value as Record<string, unknown>).alg || "") === E2EE_ALGORITHM
     && typeof (value as Record<string, unknown>).iv === "string"
     && typeof (value as Record<string, unknown>).salt === "string"
     && Number.isSafeInteger(Number((value as Record<string, unknown>).n))
     && typeof (value as Record<string, unknown>).ciphertext === "string"
+    && typeof (value as Record<string, unknown>).senderDeviceId === "string"
+    && typeof (value as Record<string, unknown>).signature === "string"
   );
 }
 
@@ -216,6 +275,7 @@ export async function encryptRoomPayload(
 ): Promise<EncryptedEnvelope> {
   const normalizedRoomId = validateRoomId(roomId);
   const n = Number.isSafeInteger(counter) && counter > 0 ? counter : Date.now();
+  const signer = await getSigner();
   const salt = new Uint8Array(MESSAGE_SALT_BYTES);
   const iv = new Uint8Array(IV_BYTES);
   crypto.getRandomValues(salt);
@@ -223,21 +283,34 @@ export async function encryptRoomPayload(
 
   const key = await deriveMessageKey(roomKey, normalizedRoomId, salt, n);
   const plaintext = TEXT_ENCODER.encode(JSON.stringify(payload));
-  const aad = TEXT_ENCODER.encode(`${normalizedRoomId}:${n}:${encodeBase64Url(salt)}`);
+  const aad = TEXT_ENCODER.encode(`${normalizedRoomId}:${n}:${encodeBase64Url(salt)}:${signer.deviceId}`);
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv: strictBuffer(iv), additionalData: strictBuffer(aad) },
     key,
     strictBuffer(plaintext)
   );
-  return {
+
+  const envelope: EncryptedEnvelope = {
     v: E2EE_ENVELOPE_VERSION,
     alg: E2EE_ALGORITHM,
     n,
     salt: encodeBase64Url(salt),
     iv: encodeBase64Url(iv),
     ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
-    roomId: normalizedRoomId
+    roomId: normalizedRoomId,
+    senderDeviceId: signer.deviceId,
+    senderSigningKey: signer.publicKey
   };
+
+  const privateKey = await importDevicePrivateKey(signer.privateKey);
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    privateKey,
+    strictBuffer(signingPayload(envelope))
+  );
+  envelope.signature = encodeBase64Url(new Uint8Array(signature));
+
+  return envelope as EncryptedEnvelope;
 }
 
 /**
@@ -256,13 +329,23 @@ export async function decryptRoomPayload(
 ): Promise<unknown> {
   const normalizedRoomId = validateRoomId(roomId);
   if (!isEncryptedEnvelope(envelope)) throw new Error("QXChat: Invalid encrypted envelope structure.");
+
+  const publicKey = await importDevicePublicKey(envelope.senderSigningKey!);
+  const validSignature = await crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    publicKey,
+    strictBuffer(decodeBase64Url(envelope.signature!)),
+    strictBuffer(signingPayload(envelope))
+  );
+  if (!validSignature) throw new Error("QXChat: Invalid encrypted payload signature.");
+
   const n = Number(envelope.n);
   const salt = decodeBase64Url(envelope.salt);
   const iv = decodeBase64Url(envelope.iv);
   const ciphertext = decodeBase64Url(envelope.ciphertext);
 
   const key = await deriveMessageKey(roomKey, normalizedRoomId, salt, n);
-  const aad = TEXT_ENCODER.encode(`${normalizedRoomId}:${n}:${encodeBase64Url(salt)}`);
+  const aad = TEXT_ENCODER.encode(`${normalizedRoomId}:${n}:${encodeBase64Url(salt)}:${envelope.senderDeviceId}`);
   const plaintext = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: strictBuffer(iv), additionalData: strictBuffer(aad) },
     key,

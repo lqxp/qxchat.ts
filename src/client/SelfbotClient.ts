@@ -663,7 +663,10 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         attachment: decrypted?.attachment,
         replyToMessageId: decrypted?.replyToMessageId || rawMessage.replyToMessageId,
       }, roomId, false);
-    } catch {
+    } catch (err) {
+      console.error(`Decryption failed for room ${roomId}:`, err);
+      console.error(`Key: "${roomKey}"`);
+      console.error(`Envelope:`, JSON.stringify(envelope, null, 2));
       return this._normalizeMessageRaw(rawMessage, roomId, true);
     }
   }

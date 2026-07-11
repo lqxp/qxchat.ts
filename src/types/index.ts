@@ -99,6 +99,15 @@ export interface GatewayPayload<T = unknown> {
   u?: string;
 }
 
+export type JsonWebKey = {
+  kty?: string;
+  alg?: string;
+  use?: string;
+  key_ops?: string[];
+  ext?: boolean;
+  [key: string]: any;
+};
+
 /** E2EE payload container schema. */
 export interface EncryptedEnvelope {
   v: number;
@@ -108,6 +117,9 @@ export interface EncryptedEnvelope {
   iv: string;
   ciphertext: string;
   roomId?: string;
+  senderDeviceId?: string;
+  senderSigningKey?: JsonWebKey;
+  signature?: string;
 }
 
 /** Options for client configuration. */
