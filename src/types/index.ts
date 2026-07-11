@@ -1,6 +1,8 @@
 import type { Room } from '@client/Room';
 import type { Message } from '@client/Message';
 import type { SelfbotClient } from '@websocket';
+import type { Username, RoomId } from '@errors';
+
 
 /**
  * OP CODES used in the QXChat/lqxp WebSocket protocol.
@@ -101,8 +103,11 @@ export interface GatewayPayload<T = unknown> {
 export interface EncryptedEnvelope {
   v: number;
   alg: string;
+  n: number;
+  salt: string;
   iv: string;
   ciphertext: string;
+  roomId?: string;
 }
 
 /** Options for client configuration. */
@@ -121,6 +126,8 @@ export interface ClientOptions {
   minReconnectDelay?: number;
   /** Maximum reconnect delay backoff in ms. Defaults to 30000. */
   maxReconnectDelay?: number;
+  /** Optional Proxy URL (e.g. 'http://user:pass@proxy:8080') for native Bun fetch & WebSocket. */
+  proxy?: string;
 }
 
 export enum Events {
@@ -146,16 +153,16 @@ export interface ClientEvents {
   ready: (client: SelfbotClient) => void;
   message: (message: Message) => void;
   messageUpdate: (message: Message) => void;
-  messageDelete: (data: { roomId: string; messageId: string }) => void;
-  roomMessagesClear: (data: { roomId: string; messageIds: string[] }) => void;
+  messageDelete: (data: { roomId: RoomId; messageId: string }) => void;
+  roomMessagesClear: (data: { roomId: RoomId; messageIds: string[] }) => void;
   roomUpdate: (room: Room) => void;
-  messageReactionUpdate: (data: { roomId: string; messageId: string; reactions: string[] }) => void;
-  typingStart: (data: { roomId: string; username: string }) => void;
-  typingEnd: (data: { roomId: string; username: string }) => void;
-  presenceUpdate: (data: { username: string; status: string }) => void;
-  userJoin: (data: { roomId: string; username: string }) => void;
-  userLeave: (data: { roomId: string; username: string }) => void;
-  profileUpdate: (data: { username: string; profile: Record<string, unknown> }) => void;
+  messageReactionUpdate: (data: { roomId: RoomId; messageId: string; reactions: string[] }) => void;
+  typingStart: (data: { roomId: RoomId; username: Username }) => void;
+  typingEnd: (data: { roomId: RoomId; username: Username }) => void;
+  presenceUpdate: (data: { username: Username; status: PresenceStatus }) => void;
+  userJoin: (data: { roomId: RoomId; username: Username }) => void;
+  userLeave: (data: { roomId: RoomId; username: Username }) => void;
+  profileUpdate: (data: { username: Username; profile: APIProfile }) => void;
   error: (err: Error) => void;
   disconnect: (reason: string) => void;
 }
@@ -298,4 +305,10 @@ export interface Profile {
   bannerUrl: string;
   description: string;
   pronouns: string;
+}
+
+declare global {
+  interface RequestInit {
+    proxy?: string;
+  }
 }

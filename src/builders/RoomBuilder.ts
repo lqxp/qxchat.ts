@@ -1,14 +1,14 @@
-import { validateRoomTitle } from '@errors';
+import { validateRoomTitle, type RoomTitle } from '@errors';
 
 export interface RoomPayload {
-  title: string;
+  title: RoomTitle;
 }
 
 /**
  * Fluent builder for room metadata updates.
  */
 export class RoomBuilder {
-  private _title = '';
+  private _title: RoomTitle = '' as RoomTitle;
 
   /**
    * Sets the title of the room.
@@ -19,16 +19,16 @@ export class RoomBuilder {
    */
   setTitle(text: string): this {
     validateRoomTitle(text);
-    this._title = text.trim();
+    this._title = text.trim() as RoomTitle;
     return this;
   }
 
   /**
    * Retrieves the current room title.
    * 
-   * @returns {string} The room title.
+   * @returns {RoomTitle} The room title.
    */
-  get title(): string {
+  get title(): RoomTitle {
     return this._title;
   }
 

@@ -1,7 +1,7 @@
-import { OpCode, PresenceStatus, MessageKind, ProfileImageKind, ClientPlatform, type GatewayPayload, type APIMessage, type HelloPayload, type APIAttachment, type ClientOptions, type ClientEvents } from '@types';
+import { OpCode, PresenceStatus, MessageKind, ProfileImageKind, ClientPlatform, type GatewayPayload, type APIMessage, type HelloPayload, type APIAttachment, type ClientOptions, type ClientEvents, type APIProfile } from '@types';
 import { Room } from '@client/Room';
 import { Message } from '@client/Message';
-import { sanitizeAndValidateUsername, validateRoomId, validateRoomTitle, validateRoomNote } from '@errors';
+import { sanitizeAndValidateUsername, validateRoomId, validateRoomTitle, validateRoomNote, type Username, type RoomId, type RoomTitle, type RoomNote } from '@errors';
 import { parseRoomAccessToken, generateRoomAccessToken, encryptRoomPayload, decryptRoomPayload } from '@crypto';
 import { MessageBuilder, ProfileBuilder, RoomBuilder } from '@builders';
 
@@ -71,7 +71,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
   public connected = false;
   public identified = false;
   public userId = '';
-  public username = '';
+  public username = '' as Username;
   public authToken = '';
   public status: PresenceStatus = PresenceStatus.Online;
   public deleteMessagesOnLeave = false;
@@ -84,14 +84,15 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
   private _manualClose = false;
 
   // Caching
-  public readonly roomKeys = new Map<string, string>(); // roomId -> roomKey
-  public readonly rooms = new Map<string, Room>();
-  public readonly activeRoomsList: string[] = [];
-  public readonly roomNotes = new Map<string, string>(); // roomId -> private note
-  public readonly usersByRoom = new Map<string, string[]>(); // roomId -> usernames
-  public readonly profilesByUser = new Map<string, Record<string, unknown>>(); // username -> raw profile
-  public readonly statusesByUser = new Map<string, PresenceStatus>(); // username -> status
-  public readonly badgesByUser = new Map<string, string[]>(); // username -> badges
+  public readonly roomKeys = new Map<RoomId, string>(); // roomId -> roomKey
+  public readonly roomRatchets = new Map<RoomId, number>(); // roomId -> ratchet counter
+  public readonly rooms = new Map<RoomId, Room>();
+  public readonly activeRoomsList: RoomId[] = [];
+  public readonly roomNotes = new Map<RoomId, RoomNote>(); // roomId -> private note
+  public readonly usersByRoom = new Map<RoomId, Username[]>(); // roomId -> usernames
+  public readonly profilesByUser = new Map<Username, APIProfile>(); // username -> raw profile
+  public readonly statusesByUser = new Map<Username, PresenceStatus>(); // username -> status
+  public readonly badgesByUser = new Map<Username, string[]>(); // username -> badges
   public badges: string[] = []; // own badges
   /** True if the current account has admin privileges. */
   public isAdmin = false;
@@ -107,7 +108,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
   public static async fetchToken(
     username: string,
     password: string,
-    apiBaseUrl = 'https://qxch.at'
+    apiBaseUrl = 'https://qxch.at',
+    proxy?: string
   ): Promise<string> {
     const cleanUrl = apiBaseUrl.replace(/\/+$/, '');
     const res = await fetch(`${cleanUrl}/api/auth/login`, {
@@ -116,7 +118,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       body: JSON.stringify({
         username: username.trim().toLowerCase(),
         password
-      })
+      }),
+      proxy: proxy || undefined
     });
     const d = (await res.json().catch(() => ({}))) as { token?: string; error?: string; ok?: boolean };
     if (!res.ok || d?.ok === false) {
@@ -138,6 +141,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       autoReconnect: options.autoReconnect !== false,
       minReconnectDelay: options.minReconnectDelay || 1000,
       maxReconnectDelay: options.maxReconnectDelay || 30000,
+      proxy: options.proxy || ''
     };
     this._dnsPrefetch();
   }
@@ -174,7 +178,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         headers: {
           'content-type': 'application/json',
           'authorization': `Bearer ${activeToken}`
-        }
+        },
+        proxy: this.options.proxy || undefined
       });
 
       const d = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; user?: { username?: string } };
@@ -230,7 +235,13 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     if (this.ws) return;
 
     try {
-      this.ws = new WebSocket(this.options.wsUrl);
+      if (this.options.proxy) {
+        this.ws = new WebSocket(this.options.wsUrl, {
+          proxy: this.options.proxy
+        });
+      } else {
+        this.ws = new WebSocket(this.options.wsUrl);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.emit('error', new Error(`Connection failed: ${msg}`));
@@ -327,7 +338,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     }
   }
 
-  private _send(op: OpCode, d: any) {
+  private _send(op: OpCode, d: unknown) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ op, d }));
     }
@@ -357,12 +368,12 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         }
         this.userId = String(data.id || data.userId || data.uuid || '');
         // Server may echo back username / admin flag in the ACK
-        if (data.username) this.username = String(data.username);
+        if (data.username) this.username = String(data.username) as Username;
         if (data.admin !== undefined) this.isAdmin = Boolean(data.admin);
         if (Array.isArray(data.badges)) {
           this.badges = data.badges.map(String);
           if (this.username) {
-            this.badgesByUser.set(this.username.trim().toLowerCase(), this.badges);
+            this.badgesByUser.set(this.username.trim().toLowerCase() as Username, this.badges);
           }
         }
         this.identified = true;
@@ -389,7 +400,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       case OpCode.MessageDeleted: {
         if (data.messageId && data.gameId) {
           this.emit('messageDelete', {
-            roomId: String(data.gameId),
+            roomId: String(data.gameId) as RoomId,
             messageId: String(data.messageId)
           });
         }
@@ -398,7 +409,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       case OpCode.RoomMessagesDeleted: {
         if (data.gameId && Array.isArray(data.messageIds)) {
           this.emit('roomMessagesClear', {
-            roomId: String(data.gameId),
+            roomId: String(data.gameId) as RoomId,
             messageIds: (data.messageIds as unknown[]).map(String)
           });
         }
@@ -410,16 +421,16 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         if (roomId) {
           const room = this._updateRoomCache(data);
           if (data.joined) {
-            const username = String(data.joined);
-            const currentUsers = this.usersByRoom.get(roomId) || [];
+            const username = String(data.joined) as Username;
+            const currentUsers = this.usersByRoom.get(roomId as RoomId) || [];
             if (!currentUsers.includes(username)) {
               currentUsers.push(username);
-              this.usersByRoom.set(roomId, currentUsers);
+              this.usersByRoom.set(roomId as RoomId, currentUsers);
               if (!room.members.includes(username)) {
                 room.members.push(username);
               }
             }
-            this.emit('userJoin', { roomId, username });
+            this.emit('userJoin', { roomId: roomId as RoomId, username: username as Username });
           } else if (data.ok && !data.system) {
             this.emit('roomUpdate', room);
           }
@@ -430,14 +441,14 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         const roomPayload = data.room as Record<string, unknown> | undefined;
         const roomId = roomPayload?.room_id || roomPayload?.roomId || data.gameId;
         if (roomId) {
-          const roomIdStr = String(roomId);
+          const roomIdStr = String(roomId) as RoomId;
           if (data.ok) {
             this.rooms.delete(roomIdStr);
             const idx = this.activeRoomsList.indexOf(roomIdStr);
             if (idx !== -1) this.activeRoomsList.splice(idx, 1);
             this.usersByRoom.delete(roomIdStr);
           } else if (data.left) {
-            const username = String(data.left);
+            const username = String(data.left) as Username;
             const currentUsers = this.usersByRoom.get(roomIdStr) || [];
             this.usersByRoom.set(roomIdStr, currentUsers.filter(u => u !== username));
             const room = this.rooms.get(roomIdStr);
@@ -445,8 +456,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
               room.members = room.members.filter(u => u !== username);
             }
             this.emit('userLeave', {
-              roomId: roomIdStr,
-              username
+              roomId: roomIdStr as RoomId,
+              username: username as Username
             });
           }
         }
@@ -457,21 +468,21 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
           const roomId = String(data.gameId);
           const username = String(data.username);
           if (data.typing) {
-            this.emit('typingStart', { roomId, username });
+            this.emit('typingStart', { roomId: roomId as RoomId, username: username as Username });
           } else {
-            this.emit('typingEnd', { roomId, username });
+            this.emit('typingEnd', { roomId: roomId as RoomId, username: username as Username });
           }
         }
         break;
       }
       case OpCode.PresenceStatus: {
         if (data.user) {
-          const username = String(data.user);
+          const username = String(data.user) as Username;
           const status = (String(data.status || 'online') as PresenceStatus) || PresenceStatus.Online;
           this.statusesByUser.set(username, status);
           if (data.profile) {
             const existing = this.profilesByUser.get(username) || {};
-            this.profilesByUser.set(username, { ...existing, ...(data.profile as Record<string, unknown>) });
+            this.profilesByUser.set(username, { ...existing, ...(data.profile as APIProfile) });
           }
           this.emit('presenceUpdate', {
             username,
@@ -481,9 +492,9 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         break;
       }
       case OpCode.ProfileUpdate: {
-        const user = String(data.user || '');
+        const user = String(data.user || '') as Username;
         if (user) {
-          const incomingProfile = data.profile as Record<string, unknown> | undefined;
+          const incomingProfile = data.profile as APIProfile | undefined;
           if (incomingProfile) {
             const existing = this.profilesByUser.get(user) || {};
             this.profilesByUser.set(user, { ...existing, ...incomingProfile });
@@ -502,7 +513,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       case OpCode.ReactionSync: {
         if (data.messageId && data.gameId) {
           this.emit('messageReactionUpdate', {
-            roomId: String(data.gameId),
+            roomId: String(data.gameId) as RoomId,
             messageId: String(data.messageId),
             reactions: Array.isArray(data.reactions) ? data.reactions.map(String) : []
           });
@@ -543,7 +554,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
   private _updateRoomCache(d: unknown): Room {
     const data = d as Record<string, unknown>;
     const roomPayload = data.room as Record<string, unknown> | undefined;
-    const roomId = String(roomPayload?.room_id || roomPayload?.roomId || data.gameId || '');
+    const roomId = String(roomPayload?.room_id || roomPayload?.roomId || data.gameId || '') as RoomId;
     if (!roomId) throw new Error("QXChat: Missing room ID in snapshot.");
 
     let room = this.rooms.get(roomId);
@@ -564,50 +575,50 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     const lastSender = String(roomPayload?.lastSender || room?.lastSender || '');
 
     if (room) {
-      room.title = title;
+      room.title = title as RoomTitle;
       room.iconUrl = iconUrl;
-      room.members = members;
+      room.members = members as Username[];
       room.lastPreview = lastPreview;
       room.lastTimestamp = lastTimestamp;
-      room.lastSender = lastSender;
+      room.lastSender = lastSender as Username;
     } else {
-      room = new Room(this, roomId, title, iconUrl, members, lastPreview, lastTimestamp, lastSender);
-      this.rooms.set(roomId, room);
+      room = new Room(this, roomId as RoomId, title as RoomTitle, iconUrl, members as Username[], lastPreview, lastTimestamp, lastSender as Username);
+      this.rooms.set(roomId as RoomId, room);
     }
 
-    if (!this.activeRoomsList.includes(roomId)) {
-      this.activeRoomsList.push(roomId);
+    if (!this.activeRoomsList.includes(roomId as RoomId)) {
+      this.activeRoomsList.push(roomId as RoomId);
     }
 
     if (Array.isArray(data.players)) {
       const players = (data.players as Array<Record<string, unknown> | string>).map(p => {
         if (typeof p === 'object' && p) {
-          const username = String(p.username || p.user || '').trim().toLowerCase();
+          const username = String(p.username || p.user || '').trim().toLowerCase() as Username;
           if (username && Array.isArray(p.badges)) {
             this.badgesByUser.set(username, p.badges.map(String));
           }
-          return String(p.username || p.user || '');
+          return String(p.username || p.user || '') as Username;
         }
-        return String(p);
+        return String(p) as Username;
       });
-      this.usersByRoom.set(roomId, players);
+      this.usersByRoom.set(roomId as RoomId, players);
     } else if (roomPayload) {
-      this.usersByRoom.set(roomId, members);
+      this.usersByRoom.set(roomId as RoomId, members as Username[]);
     }
 
     if (data.profiles && typeof data.profiles === 'object') {
       for (const [username, profile] of Object.entries(data.profiles as Record<string, unknown>)) {
-        const key = username.trim().toLowerCase();
+        const key = username.trim().toLowerCase() as Username;
         if (key && profile && typeof profile === 'object') {
           const existing = this.profilesByUser.get(key) || {};
-          this.profilesByUser.set(key, { ...existing, ...profile });
+          this.profilesByUser.set(key, { ...existing, ...(profile as APIProfile) });
         }
       }
     }
 
     if (data.statuses && typeof data.statuses === 'object') {
       for (const [username, status] of Object.entries(data.statuses as Record<string, string>)) {
-        const key = username.trim().toLowerCase();
+        const key = username.trim().toLowerCase() as Username;
         if (key && status) {
           this.statusesByUser.set(key, status as PresenceStatus);
         }
@@ -615,7 +626,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     }
 
     if (this.username) {
-      const ownBadges = this.badgesByUser.get(this.username.trim().toLowerCase());
+      const ownBadges = this.badgesByUser.get(this.username.trim().toLowerCase() as Username);
       if (ownBadges) {
         this.badges = ownBadges;
       }
@@ -635,17 +646,22 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       return this._normalizeMessageRaw(rawMessage, roomId, false);
     }
 
-    const roomKey = this.roomKeys.get(roomId);
+    const roomKey = this.roomKeys.get(roomId as RoomId);
     if (!roomKey) {
-      return this._normalizeMessageRaw(rawMessage, roomId, true); // Retain encrypted placeholder
+      return this._normalizeMessageRaw(rawMessage, roomId as RoomId, true); // Retain encrypted placeholder
     }
 
     try {
-      const decrypted = (await decryptRoomPayload(roomKey, roomId, envelope)) as { text?: string; attachment?: APIAttachment | null };
+      const decrypted = (await decryptRoomPayload(roomKey, roomId, envelope)) as {
+        text?: string;
+        attachment?: APIAttachment | null;
+        replyToMessageId?: string | null;
+      };
       return this._normalizeMessageRaw({
         ...rawMessage,
         text: decrypted?.text,
         attachment: decrypted?.attachment,
+        replyToMessageId: decrypted?.replyToMessageId || rawMessage.replyToMessageId,
       }, roomId, false);
     } catch {
       return this._normalizeMessageRaw(rawMessage, roomId, true);
@@ -677,9 +693,9 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
 
     return new Message(this, {
       messageId: message.messageId,
-      roomId: message.roomId || message.gameId || fallbackRoomId,
+      roomId: (message.roomId || message.gameId || fallbackRoomId) as RoomId,
       user: message.user || 'Unknown',
-      username,
+      username: username as Username,
       text,
       rawText: text,
       timestamp: message.timestamp || Date.now(),
@@ -703,7 +719,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
   /**
    * Joins a room using a token (derives E2EE key) or raw room ID.
    *
-   * @param {string} tokenOrRoomId 64-char room access invite token or 32-char hex room ID.
+   * @param {string} tokenOrRoomId 96-char room access invite token or 32-char hex room ID.
    * @param {object} [options] Connection options.
    * @param {boolean} [options.silentJoin] True to join without broadcasting a presence packet.
    * @returns {Promise<void>} Resolves when the join message is dispatched.
@@ -711,7 +727,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    */
   public async joinRoom(tokenOrRoomId: string, options?: { silentJoin?: boolean }): Promise<void> {
     let roomId = tokenOrRoomId;
-    if (tokenOrRoomId.length === 64) {
+    if (tokenOrRoomId.length === 96) {
       roomId = this.registerRoomToken(tokenOrRoomId);
     }
 
@@ -729,7 +745,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when the leave payload is dispatched.
    * @throws {Error} If roomId check fails.
    */
-  public async leaveRoom(roomId: string): Promise<void> {
+  public async leaveRoom(roomId: RoomId | string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     this._send(OpCode.Leave, { gameId: cleanRoomId });
   }
@@ -742,18 +758,18 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when message has been encrypted and sent.
    * @throws {Error} If validation fails or encryption fails.
    */
-  public async sendMessage(roomId: string, content: string | MessageBuilder): Promise<void> {
+  public async sendMessage(roomId: RoomId | string, content: string | MessageBuilder): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     const builder = content instanceof MessageBuilder ? content : new MessageBuilder(content);
     const key = this.roomKeys.get(cleanRoomId);
 
     if (key) {
-      const encrypted = await builder.toEncrypted(key, cleanRoomId);
+      const nextCounter = Math.max(0, Math.floor(this.roomRatchets.get(cleanRoomId) || 0)) + 1;
+      this.roomRatchets.set(cleanRoomId, nextCounter);
+      const encrypted = await builder.toEncrypted(key, cleanRoomId, nextCounter);
       this._send(OpCode.Message, {
-        text: '',
         gameId: cleanRoomId,
-        encrypted,
-        replyToMessageId: builder.replyToMessageId
+        encrypted
       });
     } else {
       this._send(OpCode.Message, {
@@ -774,16 +790,17 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when the edit payload is sent.
    * @throws {Error} If validation fails.
    */
-  public async editMessage(roomId: string, messageId: string, content: string): Promise<void> {
+  public async editMessage(roomId: RoomId | string, messageId: string, content: string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     const key = this.roomKeys.get(cleanRoomId);
 
     if (key) {
-      const encrypted = await encryptRoomPayload(key, cleanRoomId, { text: content, attachment: null });
+      const nextCounter = Math.max(0, Math.floor(this.roomRatchets.get(cleanRoomId) || 0)) + 1;
+      this.roomRatchets.set(cleanRoomId, nextCounter);
+      const encrypted = await encryptRoomPayload(key, cleanRoomId, { text: content, attachment: null }, nextCounter);
       this._send(OpCode.EditMessage, {
         messageId,
         gameId: cleanRoomId,
-        text: '',
         encrypted
       });
     } else {
@@ -803,7 +820,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when delete command is dispatched.
    * @throws {Error} If validation fails.
    */
-  public async deleteMessage(roomId: string, messageId: string): Promise<void> {
+  public async deleteMessage(roomId: RoomId | string, messageId: string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     this._send(OpCode.DeleteMessage, {
       messageId,
@@ -819,7 +836,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when typing status packet is dispatched.
    * @throws {Error} If validation fails.
    */
-  public async sendTyping(roomId: string, typing: boolean): Promise<void> {
+  public async sendTyping(roomId: RoomId | string, typing: boolean): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     this._send(OpCode.Typing, {
       gameId: cleanRoomId,
@@ -835,9 +852,9 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when title update message is sent.
    * @throws {Error} If validation fails.
    */
-  public async setRoomTitle(roomId: string, title: string | RoomBuilder): Promise<void> {
+  public async setRoomTitle(roomId: RoomId | string, title: RoomTitle | RoomBuilder | string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
-    const cleanTitle = title instanceof RoomBuilder ? title.title : title;
+    const cleanTitle = title instanceof RoomBuilder ? title.title : (title as RoomTitle);
     validateRoomTitle(cleanTitle);
 
     this._send(OpCode.RoomSnapshot, {
@@ -853,7 +870,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when request is sent.
    * @throws {Error} If validation fails.
    */
-  public async fetchHistory(roomId: string): Promise<void> {
+  public async fetchHistory(roomId: RoomId | string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     this._send(OpCode.History, { gameId: cleanRoomId });
   }
@@ -906,7 +923,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when reaction update packet is sent.
    * @throws {Error} If validation fails.
    */
-  public async toggleReaction(roomId: string, messageId: string, emoji: string): Promise<void> {
+  public async toggleReaction(roomId: RoomId | string, messageId: string, emoji: string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     this._send(OpCode.ReactionSend, {
       messageId,
@@ -940,7 +957,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     const res = await fetch(`${base}/api/profile/image`, {
       method: 'POST',
       headers: { 'authorization': `Bearer ${this.authToken}` },
-      body: form
+      body: form,
+      proxy: this.options.proxy || undefined
     });
 
     const d = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
@@ -959,7 +977,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @throws {Error} If not logged in, validation fails, or upload fails.
    */
   public async uploadRoomIcon(
-    roomId: string,
+    roomId: RoomId | string,
     fileBuffer: Uint8Array | ArrayBuffer | Blob,
     filename = 'icon.png'
   ): Promise<string> {
@@ -974,7 +992,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     const res = await fetch(`${base}/api/rooms/${encodeURIComponent(cleanRoomId)}/icon`, {
       method: 'POST',
       headers: { 'authorization': `Bearer ${this.authToken}` },
-      body: form
+      body: form,
+      proxy: this.options.proxy || undefined
     });
 
     const d = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; room?: { icon?: { url?: string; file?: { url?: string } } } };
@@ -1003,7 +1022,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         'content-type': 'application/json',
         ...(this.authToken ? { 'authorization': `Bearer ${this.authToken}` } : {}),
         ...(init.headers as Record<string, string> | undefined ?? {})
-      }
+      },
+      proxy: this.options.proxy || undefined
     });
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
     if (!res.ok || data?.ok === false) {
@@ -1022,15 +1042,17 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @throws {Error} If registration fails.
    */
   public static async register(
-    username: string,
+    username: Username | string,
     password: string,
-    apiBaseUrl = 'https://qxch.at'
+    apiBaseUrl = 'https://qxch.at',
+    proxy?: string
   ): Promise<string> {
     const base = apiBaseUrl.replace(/\/+$/, '');
     const res = await fetch(`${base}/api/auth/register`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: username.trim().toLowerCase(), password })
+      body: JSON.stringify({ username: username.trim().toLowerCase(), password }),
+      proxy: proxy || undefined
     });
     const d = (await res.json().catch(() => ({}))) as { token?: string; ok?: boolean; error?: string };
     if (!res.ok || d?.ok === false) throw new Error(d?.error ?? `Registration failed: ${res.status}`);
@@ -1049,10 +1071,11 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @throws {Error} If recovery fails.
    */
   public static async recoverAccount(
-    username: string,
+    username: Username | string,
     recoveryWords: string,
     newPassword: string,
-    apiBaseUrl = 'https://qxch.at'
+    apiBaseUrl = 'https://qxch.at',
+    proxy?: string
   ): Promise<string> {
     const base = apiBaseUrl.replace(/\/+$/, '');
     const res = await fetch(`${base}/api/auth/recover`, {
@@ -1062,7 +1085,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         username: username.trim().toLowerCase(),
         recoveryWords,
         newPassword
-      })
+      }),
+      proxy: proxy || undefined
     });
     const d = (await res.json().catch(() => ({}))) as { token?: string; ok?: boolean; error?: string };
     if (!res.ok || d?.ok === false) throw new Error(d?.error ?? `Recovery failed: ${res.status}`);
@@ -1077,7 +1101,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<void>} Resolves when the name change succeeds.
    * @throws {Error} If not logged in or validation/request fails.
    */
-  public async changeUsername(newUsername: string): Promise<void> {
+  public async changeUsername(newUsername: Username | string): Promise<void> {
     if (!this.authToken) throw new Error("QXChat: Not logged in.");
     const clean = sanitizeAndValidateUsername(newUsername);
     const data = await this._apiRequest('/api/auth/username', {
@@ -1085,7 +1109,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       body: JSON.stringify({ username: clean })
     });
     const nextUsername = String((data.user as Record<string, unknown>)?.username ?? clean);
-    this.username = nextUsername;
+    this.username = nextUsername as Username;
   }
 
   /**
@@ -1115,7 +1139,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     if (!this.authToken) throw new Error("QXChat: Not logged in.");
     const data = await this._apiRequest('/api/auth/me');
     const username = String((data.user as Record<string, unknown>)?.username ?? this.username);
-    this.username = username;
+    this.username = username as Username;
     return username;
   }
 
@@ -1142,14 +1166,14 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {Promise<Room>} The created room instance.
    * @throws {Error} If join or metadata set fails.
    */
-  public async createRoom(title?: string): Promise<Room> {
+  public async createRoom(title?: RoomTitle | string): Promise<Room> {
     const { roomId, roomKey } = generateRoomAccessToken();
     this.registerRoomKey(roomId, roomKey);
     await this.joinRoom(roomId);
 
     let room = this.rooms.get(roomId);
     if (!room) {
-      room = new Room(this, roomId, title || '');
+      room = new Room(this, roomId, (title || '') as RoomTitle);
       this.rooms.set(roomId, room);
     }
     if (title) {
@@ -1165,7 +1189,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @param {string} note Note content.
    * @throws {Error} If validation fails.
    */
-  public setRoomNote(roomId: string, note: string): void {
+  public setRoomNote(roomId: RoomId | string, note: RoomNote | string): void {
     const cleanRoomId = validateRoomId(roomId);
     const cleanNote = validateRoomNote(note);
     if (cleanNote) {
@@ -1182,9 +1206,9 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {string} The cached note content or empty string.
    * @throws {Error} If validation fails.
    */
-  public getRoomNote(roomId: string): string {
+  public getRoomNote(roomId: RoomId | string): RoomNote {
     const cleanRoomId = validateRoomId(roomId);
-    return this.roomNotes.get(cleanRoomId) || '';
+    return this.roomNotes.get(cleanRoomId) || '' as RoomNote;
   }
 
   /**
@@ -1193,7 +1217,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @param {string} username The target username.
    * @returns {Room[]} Shared room instances array.
    */
-  public mutualRoomsWith(username: string): Room[] {
+  public mutualRoomsWith(username: Username | string): Room[] {
     const target = username.trim().toLowerCase();
     const me = this.username.trim().toLowerCase();
     if (!target || !me) return [];
@@ -1214,8 +1238,8 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @param {string} username The username.
    * @returns {Record<string, unknown> | null} The cached profile object or null.
    */
-  public getUserProfile(username: string): Record<string, unknown> | null {
-    const key = username.trim().toLowerCase();
+  public getUserProfile(username: Username | string): APIProfile | null {
+    const key = username.trim().toLowerCase() as Username;
     return this.profilesByUser.get(key) || null;
   }
 
@@ -1226,7 +1250,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    * @returns {string[]} List of cached member usernames.
    * @throws {Error} If validation fails.
    */
-  public getRoomMembers(roomId: string): string[] {
+  public getRoomMembers(roomId: RoomId | string): Username[] {
     const cleanRoomId = validateRoomId(roomId);
     const room = this.rooms.get(cleanRoomId);
     if (room) return room.members;
@@ -1240,7 +1264,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
    */
   public exportSnapshot(): string {
     const snapshot = {
-      version: 4,
+      version: 5,
       exportedAt: new Date().toISOString(),
       username: this.username,
       status: this.status,
@@ -1254,6 +1278,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
         lastSender: r.lastSender
       })),
       roomKeys: Array.from(this.roomKeys.entries()),
+      roomRatchets: Array.from(this.roomRatchets.entries()),
       roomNotes: Array.from(this.roomNotes.entries()),
       deleteMessagesOnLeave: this.deleteMessagesOnLeave,
       serverClearsLocalMessages: this.serverClearsLocalMessages
@@ -1282,6 +1307,11 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     if (Array.isArray(data.roomNotes)) {
       for (const [roomId, note] of data.roomNotes) {
         this.roomNotes.set(roomId, note);
+      }
+    }
+    if (Array.isArray(data.roomRatchets)) {
+      for (const [roomId, ratchet] of data.roomRatchets) {
+        this.roomRatchets.set(roomId, ratchet);
       }
     }
     if (Array.isArray(data.rooms)) {

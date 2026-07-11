@@ -1,40 +1,41 @@
 import type { SelfbotClient } from '@websocket';
 import { MessageBuilder, RoomBuilder } from '@builders';
+import { type Username, type RoomId, type RoomTitle, type RoomNote } from '@errors';
 
 /**
  * Represents a chat room/channel in QXChat.
  */
 export class Room {
   private readonly client: SelfbotClient;
-  public readonly roomId: string;
-  public title: string;
+  public readonly roomId: RoomId;
+  public title: RoomTitle;
   public iconUrl: string;
-  public members: string[];
+  public members: Username[];
   public lastPreview: string;
   public lastTimestamp: number;
-  public lastSender: string;
+  public lastSender: Username;
 
   /**
    * Creates a Room instance.
    * 
    * @param {SelfbotClient} client The active client instance.
-   * @param {string} roomId The room ID.
-   * @param {string} [title=''] The room title.
+   * @param {RoomId} roomId The room ID.
+   * @param {RoomTitle} [title] The room title.
    * @param {string} [iconUrl=''] The room icon URL.
-   * @param {string[]} [members=[]] Initial list of member usernames.
+   * @param {Username[]} [members=[]] Initial list of member usernames.
    * @param {string} [lastPreview=''] The last message text snippet.
    * @param {number} [lastTimestamp=0] Timestamp of last activity.
-   * @param {string} [lastSender=''] Username of last message sender.
+   * @param {Username} [lastSender] Username of last message sender.
    */
   constructor(
     client: SelfbotClient,
-    roomId: string,
-    title = '',
+    roomId: RoomId,
+    title: RoomTitle = '' as RoomTitle,
     iconUrl = '',
-    members: string[] = [],
+    members: Username[] = [],
     lastPreview = '',
     lastTimestamp = 0,
-    lastSender = ''
+    lastSender: Username = '' as Username
   ) {
     this.client = client;
     this.roomId = roomId;
@@ -78,10 +79,10 @@ export class Room {
   /**
    * Sets the title of this room.
    * 
-   * @param {string | RoomBuilder} title The new title string or RoomBuilder.
+   * @param {RoomTitle | RoomBuilder | string} title The new title string or RoomBuilder.
    * @returns {Promise<void>} Resolves when name updates.
    */
-  public async setTitle(title: string | RoomBuilder): Promise<void> {
+  public async setTitle(title: RoomTitle | RoomBuilder | string): Promise<void> {
     return this.client.setRoomTitle(this.roomId, title);
   }
 
@@ -98,7 +99,7 @@ export class Room {
    * Generates a room access token (invite code) for this room.
    * The token encodes both the room ID and the E2EE room key.
    * 
-   * @returns {string} 64-character invite token.
+   * @returns {string} 96-character invite token.
    * @throws {Error} If key is missing from client cache.
    */
   public createInvite(): string {
@@ -127,24 +128,24 @@ export class Room {
    * @returns {Promise<void>} Resolves when title is cleared.
    */
   public async clearTitle(): Promise<void> {
-    return this.client.setRoomTitle(this.roomId, '');
+    return this.client.setRoomTitle(this.roomId, '' as RoomTitle);
   }
 
   /**
    * Sets a local client-side note for this room.
    * 
-   * @param {string} note Note text.
+   * @param {RoomNote | string} note Note text.
    */
-  public setNote(note: string): void {
+  public setNote(note: RoomNote | string): void {
     this.client.setRoomNote(this.roomId, note);
   }
 
   /**
    * Retrieves the local client-side note for this room.
    * 
-   * @returns {string} Note text or empty string.
+   * @returns {RoomNote} Note text or empty string.
    */
-  public getNote(): string {
+  public getNote(): RoomNote {
     return this.client.getRoomNote(this.roomId);
   }
 }

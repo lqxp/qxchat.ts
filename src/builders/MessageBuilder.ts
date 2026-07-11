@@ -1,4 +1,4 @@
-import { validateMessageText, validateAttachmentSize } from '@errors';
+import { validateMessageText, validateAttachmentSize, type MessageText, type RoomId } from '@errors';
 import { encryptRoomPayload } from '@crypto';
 import type { APIAttachment, EncryptedEnvelope } from '@types';
 
@@ -6,7 +6,7 @@ import type { APIAttachment, EncryptedEnvelope } from '@types';
  * Fluent builder for constructing E2EE message payloads.
  */
 export class MessageBuilder {
-  private _text = '';
+  private _text: MessageText = '' as MessageText;
   private _replyToMessageId: string | null = null;
   private _attachment: APIAttachment | null = null;
 
@@ -30,16 +30,16 @@ export class MessageBuilder {
    */
   setText(text: string): this {
     validateMessageText(text);
-    this._text = text;
+    this._text = text as MessageText;
     return this;
   }
 
   /**
    * Retrieves the current text content of the message.
    * 
-   * @returns {string} The text content.
+   * @returns {MessageText} The text content.
    */
-  get text(): string {
+  get text(): MessageText {
     return this._text;
   }
 
@@ -116,25 +116,27 @@ export class MessageBuilder {
   /**
    * Converts the builder configuration to a plain text representation.
    * 
-   * @returns {{ text: string; attachment: APIAttachment | null }} Serializable object.
+   * @returns {{ text: MessageText; attachment: APIAttachment | null; replyToMessageId: string | null }} Serializable object.
    */
-  toJSON(): { text: string; attachment: APIAttachment | null } {
+  toJSON(): { text: MessageText; attachment: APIAttachment | null; replyToMessageId: string | null } {
     return {
       text: this._text,
       attachment: this._attachment,
+      replyToMessageId: this._replyToMessageId,
     };
   }
 
   /**
    * Encrypts the message body and attachments using AES-GCM for E2EE room messaging.
    *
-   * @param {string} roomKey The 16-byte hex room key.
-   * @param {string} roomId The room ID.
+   * @param {string} roomKey The 32-byte hex room key.
+   * @param {RoomId} roomId The room ID.
+   * @param {number} [counter] Optional ratchet counter.
    * @returns {Promise<EncryptedEnvelope>} A promise resolving to the encrypted envelope.
    * @throws {Error} If verification or encryption fails.
    */
-  async toEncrypted(roomKey: string, roomId: string): Promise<EncryptedEnvelope> {
+  async toEncrypted(roomKey: string, roomId: RoomId, counter?: number): Promise<EncryptedEnvelope> {
     const payload = this.toJSON();
-    return encryptRoomPayload(roomKey, roomId, payload);
+    return encryptRoomPayload(roomKey, roomId, payload, counter);
   }
 }

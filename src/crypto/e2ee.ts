@@ -1,52 +1,51 @@
-import type { BufferSource } from 'bun';
-import { validateRoomId } from '@errors';
+import { validateRoomId, type RoomId } from '@errors';
 import type { EncryptedEnvelope } from '@types';
 
 const ROOM_ID_BYTES = 16;
-const ROOM_KEY_BYTES = 16;
+const ROOM_KEY_BYTES = 32;
 const IV_BYTES = 12;
+const MESSAGE_SALT_BYTES = 32;
 
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
-export const E2EE_ENVELOPE_VERSION = 1;
-export const E2EE_ALGORITHM = "A128GCM";
+export const E2EE_ENVELOPE_VERSION = 2;
+export const E2EE_ALGORITHM = "QXDR-A256GCM-HKDFSHA256";
 
-
-const moliere = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(2, "0"));
+const hexCache = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
 
 function bytesToHex(bytes: Uint8Array): string {
-  let texte = "";
-  for (let idx = 0; idx < bytes.length; idx++) {
-    const octet = bytes[idx];
-    if (octet !== undefined) {
-      texte += moliere[octet] || "";
+  let text = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b !== undefined) {
+      text += hexCache[b] || "";
     }
   }
-  return texte;
+  return text;
 }
 
-const valeursHex: Record<string, number> = {};
-for (let index = 0; index < 16; index++) {
-  valeursHex[index.toString(16)] = index;
+const hexValues: Record<string, number> = {};
+for (let i = 0; i < 16; i++) {
+  hexValues[i.toString(16)] = i;
 }
 
 function hexToBytes(value: string): Uint8Array {
-  const qxchat = String(value || "").trim().toLowerCase();
-  if (!/^[0-9a-f]+$/.test(qxchat) || qxchat.length % 2 !== 0) {
+  const norm = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]+$/.test(norm) || norm.length % 2 !== 0) {
     throw new Error("QXChat E2EE Error: Invalid hex payload.");
   }
-  const octets = new Uint8Array(qxchat.length / 2);
-  for (let index = 0; index < qxchat.length; index += 2) {
-    const car1 = qxchat[index];
-    const car2 = qxchat[index + 1];
-    if (car1 !== undefined && car2 !== undefined) {
-      const poidsFort = valeursHex[car1]!;
-      const poidsFaible = valeursHex[car2]!;
-      octets[index / 2] = (poidsFort << 4) | poidsFaible;
+  const bytes = new Uint8Array(norm.length / 2);
+  for (let i = 0; i < norm.length; i += 2) {
+    const c1 = norm[i];
+    const c2 = norm[i + 1];
+    if (c1 !== undefined && c2 !== undefined) {
+      const high = hexValues[c1]!;
+      const low = hexValues[c2]!;
+      bytes[i / 2] = (high << 4) | low;
     }
   }
-  return octets;
+  return bytes;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -68,6 +67,10 @@ function base64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
+function strictBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
 export function encodeBase64Url(bytes: Uint8Array): string {
   return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
@@ -81,9 +84,9 @@ export function decodeBase64Url(value: string): Uint8Array {
 /**
  * Normalizes a hex E2EE room key. Checks size constraints.
  * 
- * @param {string} val Raw hex or text key string.
- * @returns {string} Standardized 32-character hex key string.
- * @throws {Error} If key bytes count is not exactly 16.
+ * @param {string} val Raw hex key string.
+ * @returns {string} Standardized 64-character hex key string.
+ * @throws {Error} If key bytes count is not exactly 32.
  */
 export function normalizeRoomKey(val: string): string {
   const bytes = hexToBytes(String(val || "").trim());
@@ -92,9 +95,9 @@ export function normalizeRoomKey(val: string): string {
 }
 
 /**
- * Generates a brand new random E2EE key for a room.
+ * Generates a brand new random 32-byte E2EE key for a room.
  * 
- * @returns {string} 32-character hex E2EE key.
+ * @returns {string} 64-character hex E2EE key.
  */
 export function generateRoomKey(): string {
   const bytes = new Uint8Array(ROOM_KEY_BYTES);
@@ -103,29 +106,29 @@ export function generateRoomKey(): string {
 }
 
 /**
- * Normalizes a 64-character invite token.
+ * Normalizes a 96-character invite token.
  * 
  * @param {string} val Raw room access token code.
- * @returns {string} Normalized 64-char hex string.
- * @throws {Error} If the format is not exactly 64 hex characters.
+ * @returns {string} Normalized 96-char hex string.
+ * @throws {Error} If the format is not exactly 96 hex characters.
  */
 export function normalizeRoomAccessToken(val: string): string {
   const norm = String(val || "").trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(norm)) throw new Error("QXChat: Invalid room token format.");
+  if (!/^[0-9a-f]{96}$/.test(norm)) throw new Error("QXChat: Invalid room token format.");
   return norm;
 }
 
 /**
- * Generates a random room ID and key, merging them into an invite token.
+ * Generates a random room ID and key, merging them into a 96-character invite token.
  * 
- * @returns {{ roomId: string; roomKey: string; token: string }} Token payload.
+ * @returns {{ roomId: RoomId; roomKey: string; token: string }} Token payload.
  */
-export function generateRoomAccessToken(): { roomId: string; roomKey: string; token: string } {
+export function generateRoomAccessToken(): { roomId: RoomId; roomKey: string; token: string } {
   const roomIdBytes = new Uint8Array(ROOM_ID_BYTES);
   const roomKeyBytes = new Uint8Array(ROOM_KEY_BYTES);
   crypto.getRandomValues(roomIdBytes);
   crypto.getRandomValues(roomKeyBytes);
-  const roomId = bytesToHex(roomIdBytes);
+  const roomId = bytesToHex(roomIdBytes) as RoomId;
   const roomKey = bytesToHex(roomKeyBytes);
   return {
     roomId,
@@ -135,46 +138,39 @@ export function generateRoomAccessToken(): { roomId: string; roomKey: string; to
 }
 
 /**
- * Splits a 64-character room access token into roomId and roomKey.
+ * Splits a 96-character room access token into roomId (32 chars) and roomKey (64 chars).
  * 
- * @param {string} rawValue 64-character invite token.
- * @returns {{ token: string; roomId: string; roomKey: string }} Split token components.
+ * @param {string} rawValue 96-character invite token.
+ * @returns {{ token: string; roomId: RoomId; roomKey: string }} Split token components.
  * @throws {Error} If format validation fails.
  */
-export function parseRoomAccessToken(rawValue: string): { token: string; roomId: string; roomKey: string } {
+export function parseRoomAccessToken(rawValue: string): { token: string; roomId: RoomId; roomKey: string } {
   const token = normalizeRoomAccessToken(rawValue);
   return {
     token,
-    roomId: token.slice(0, ROOM_ID_BYTES * 2),
+    roomId: token.slice(0, ROOM_ID_BYTES * 2) as RoomId,
     roomKey: token.slice(ROOM_ID_BYTES * 2)
   };
 }
 
-/**
- * Imports a hex room key into a webcrypto CryptoKey instance.
- * 
- * @param {string} roomKey Hex-encoded room key.
- * @returns {Promise<CryptoKey>} Webcrypto AES-GCM key instance.
- * @throws {Error} If the key size is invalid.
- */
-const keys = new Map<string, CryptoKey>();
-
-async function importRoomKey(roomKey: string): Promise<CryptoKey> {
-  const cache = keys.get(roomKey);
-  if (cache) return cache;
-
+async function deriveMessageKey(roomKey: string, roomId: string, salt: Uint8Array, counter: number): Promise<CryptoKey> {
   const raw = hexToBytes(roomKey);
   if (raw.length !== ROOM_KEY_BYTES) throw new Error("QXChat: Invalid room key length.");
-  const cle = await crypto.subtle.importKey(
+  const baseKey = await crypto.subtle.importKey(
     "raw",
-    raw.buffer as ArrayBuffer,
-    { name: "AES-GCM" },
+    strictBuffer(raw),
+    "HKDF",
+    false,
+    ["deriveKey"]
+  );
+  const info = TEXT_ENCODER.encode(`qxchat:e2ee:v2:${roomId}:${counter}`);
+  return crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: strictBuffer(salt), info: strictBuffer(info) },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"]
   );
-
-  keys.set(roomKey, cle);
-  return cle;
 }
 
 /**
@@ -190,51 +186,64 @@ export function isEncryptedEnvelope(value: unknown): value is EncryptedEnvelope 
     && 'v' in value
     && 'alg' in value
     && 'iv' in value
+    && 'salt' in value
+    && 'n' in value
     && 'ciphertext' in value
     && Number((value as Record<string, unknown>).v) === E2EE_ENVELOPE_VERSION
     && String((value as Record<string, unknown>).alg || "") === E2EE_ALGORITHM
     && typeof (value as Record<string, unknown>).iv === "string"
+    && typeof (value as Record<string, unknown>).salt === "string"
+    && Number.isSafeInteger(Number((value as Record<string, unknown>).n))
     && typeof (value as Record<string, unknown>).ciphertext === "string"
   );
 }
 
 /**
- * Encrypts a room payload using AES-GCM with roomId as AAD.
+ * Encrypts a room payload using HKDF derived AES-256-GCM.
  * 
- * @param {string} roomKey Hex representation of E2EE key.
+ * @param {string} roomKey Hex representation of E2EE key (64 chars).
  * @param {string} roomId Associated room identifier.
  * @param {unknown} payload Data object to encrypt.
+ * @param {number} [counter] Explicit ratchet counter. Defaults to Date.now().
  * @returns {Promise<EncryptedEnvelope>} Encrypted structure.
  * @throws {Error} If parameter limits are violated or encryption fails.
  */
 export async function encryptRoomPayload(
   roomKey: string,
   roomId: string,
-  payload: unknown
+  payload: unknown,
+  counter = Date.now()
 ): Promise<EncryptedEnvelope> {
-  const validatedRoomId = validateRoomId(roomId);
-  const key = await importRoomKey(roomKey);
+  const normalizedRoomId = validateRoomId(roomId);
+  const n = Number.isSafeInteger(counter) && counter > 0 ? counter : Date.now();
+  const salt = new Uint8Array(MESSAGE_SALT_BYTES);
   const iv = new Uint8Array(IV_BYTES);
+  crypto.getRandomValues(salt);
   crypto.getRandomValues(iv);
+
+  const key = await deriveMessageKey(roomKey, normalizedRoomId, salt, n);
   const plaintext = TEXT_ENCODER.encode(JSON.stringify(payload));
-  const aad = TEXT_ENCODER.encode(String(validatedRoomId));
+  const aad = TEXT_ENCODER.encode(`${normalizedRoomId}:${n}:${encodeBase64Url(salt)}`);
   const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: iv.buffer as ArrayBuffer, additionalData: aad.buffer as ArrayBuffer },
+    { name: "AES-GCM", iv: strictBuffer(iv), additionalData: strictBuffer(aad) },
     key,
-    plaintext.buffer as ArrayBuffer
+    strictBuffer(plaintext)
   );
   return {
     v: E2EE_ENVELOPE_VERSION,
     alg: E2EE_ALGORITHM,
+    n,
+    salt: encodeBase64Url(salt),
     iv: encodeBase64Url(iv),
-    ciphertext: encodeBase64Url(new Uint8Array(ciphertext))
+    ciphertext: encodeBase64Url(new Uint8Array(ciphertext)),
+    roomId: normalizedRoomId
   };
 }
 
 /**
- * Decrypts a room envelope using AES-GCM and verifies authenticity with roomId.
+ * Decrypts a room envelope using HKDF derived AES-256-GCM.
  * 
- * @param {string} roomKey Hex representation of E2EE key.
+ * @param {string} roomKey Hex representation of E2EE key (64 chars).
  * @param {string} roomId Associated room identifier.
  * @param {unknown} envelope Encrypted payload envelope.
  * @returns {Promise<unknown>} Plaintext JSON payload data.
@@ -245,16 +254,19 @@ export async function decryptRoomPayload(
   roomId: string,
   envelope: unknown
 ): Promise<unknown> {
-  const cleanId = validateRoomId(roomId);
+  const normalizedRoomId = validateRoomId(roomId);
   if (!isEncryptedEnvelope(envelope)) throw new Error("QXChat: Invalid encrypted envelope structure.");
-  const key = await importRoomKey(roomKey);
+  const n = Number(envelope.n);
+  const salt = decodeBase64Url(envelope.salt);
   const iv = decodeBase64Url(envelope.iv);
   const ciphertext = decodeBase64Url(envelope.ciphertext);
-  const aad = TEXT_ENCODER.encode(String(cleanId));
+
+  const key = await deriveMessageKey(roomKey, normalizedRoomId, salt, n);
+  const aad = TEXT_ENCODER.encode(`${normalizedRoomId}:${n}:${encodeBase64Url(salt)}`);
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: iv.buffer as ArrayBuffer, additionalData: aad.buffer as ArrayBuffer },
+    { name: "AES-GCM", iv: strictBuffer(iv), additionalData: strictBuffer(aad) },
     key,
-    ciphertext.buffer as ArrayBuffer
+    strictBuffer(ciphertext)
   );
   return JSON.parse(TEXT_DECODER.decode(plaintext));
 }

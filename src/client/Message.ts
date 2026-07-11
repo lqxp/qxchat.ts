@@ -1,6 +1,7 @@
 import type { SelfbotClient } from '@websocket';
 import { MessageBuilder } from '@builders';
 import { MessageKind, type Attachment, type EncryptedEnvelope } from '@types';
+import { type Username, type RoomId } from '@errors';
 
 /**
  * Represents a chat message in QXChat.
@@ -8,9 +9,9 @@ import { MessageKind, type Attachment, type EncryptedEnvelope } from '@types';
 export class Message {
   private readonly client: SelfbotClient;
   public readonly messageId: string;
-  public readonly roomId: string;
+  public readonly roomId: RoomId;
   public readonly user: string;
-  public readonly username: string;
+  public readonly username: Username;
   public text: string;
   public rawText: string;
   public readonly timestamp: number;

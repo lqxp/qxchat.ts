@@ -3,6 +3,8 @@ import {
   validateProfileDescription,
   validateAvatarSize,
   validateBannerSize,
+  type ProfileDescription,
+  type Pronouns,
 } from '@errors';
 
 export interface ProfileImagePayload {
@@ -18,8 +20,8 @@ export interface ProfileImagePayload {
 export interface ProfilePayload {
   avatar: ProfileImagePayload | null;
   banner: ProfileImagePayload | null;
-  description: string;
-  pronouns: string;
+  description: ProfileDescription;
+  pronouns: Pronouns;
 }
 
 /**
@@ -28,8 +30,8 @@ export interface ProfilePayload {
 export class ProfileBuilder {
   private _avatar: ProfileImagePayload | null = null;
   private _banner: ProfileImagePayload | null = null;
-  private _description = '';
-  private _pronouns = '';
+  private _description: ProfileDescription = '' as ProfileDescription;
+  private _pronouns: Pronouns = '' as Pronouns;
 
   /**
    * Sets the profile bio description.
@@ -40,7 +42,7 @@ export class ProfileBuilder {
    */
   setDescription(text: string): this {
     validateProfileDescription(text);
-    this._description = text.trim();
+    this._description = text.trim() as ProfileDescription;
     return this;
   }
 
@@ -53,7 +55,7 @@ export class ProfileBuilder {
    */
   setPronouns(text: string): this {
     validatePronouns(text);
-    this._pronouns = text.trim();
+    this._pronouns = text.trim() as Pronouns;
     return this;
   }
 
