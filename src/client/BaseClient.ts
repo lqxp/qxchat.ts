@@ -16,7 +16,7 @@ import {
 
 /**
  * Base client handling configuration, credentials, and HTTP REST requests.
- * Does not establish a WebSocket connection — use SelfbotClient for that.
+ * Does not establish a WebSocket connection use SelfbotClient for that.
  * Extend this class to implement custom client behavior.
  */
 export class BaseClient extends TypedEventEmitter<ClientEvents> {

@@ -314,7 +314,6 @@ export class SelfbotClient extends BaseClient implements IActionClient {
 
   /**
    * Deletes a message from a room.
-   * Uses OpCode.DeleteMessage (21) — NOT Message (7) — as required by the server protocol.
    * @param {RoomId | string} roomId Associated room ID.
    * @param {string} messageId ID of message to delete.
    */
@@ -393,7 +392,6 @@ export class SelfbotClient extends BaseClient implements IActionClient {
 
   /**
    * Toggles a reaction emoji on a message.
-   * Uses OpCode.ReactionSend (19) — NOT ReactionSync (20, which is server→client).
    * @param {RoomId | string} roomId Associated room ID.
    * @param {string} messageId Target message ID.
    * @param {string | string[]} emojis Reaction emoji(s) to toggle.

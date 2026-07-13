@@ -173,7 +173,7 @@ export class RestClient {
       method: 'POST',
       body: JSON.stringify({ password }),
     });
-    // Clear credentials inline — do NOT call logoutAccount() (would make a second REST call)
+    
     this._client.username = '' as Username;
     this._client.authToken = '';
     this._client.userId = '';
@@ -200,9 +200,7 @@ export class RestClient {
     if (this._client.authToken) {
       try {
         await this.apiRequest('/api/auth/logout', { method: 'POST' });
-      } catch {
-        // Ignore logout errors — proceed with credential cleanup regardless
-      }
+      } catch { }
     }
     this._client.username = '' as Username;
     this._client.authToken = '';
