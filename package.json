@@ -1,6 +1,6 @@
 {
   "name": "qxchat.ts",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "High-performance optimized selfbot SDK for QXChat client written natively for Bun",
   "homepage": "https://github.com/lqxp/qxchat.ts",
   "repository": {

@@ -1,169 +1,91 @@
-import { OpCode, PresenceStatus, MessageKind, ProfileImageKind, ClientPlatform, type GatewayPayload, type APIMessage, type HelloPayload, type APIAttachment, type ClientOptions, type ClientEvents, type APIProfile } from '@types';
-import { Room } from '@client/Room';
-import { Message } from '@client/Message';
-import { sanitizeAndValidateUsername, validateRoomId, validateRoomTitle, validateRoomNote, type Username, type RoomId, type RoomTitle, type RoomNote } from '@errors';
-import { parseRoomAccessToken, generateRoomAccessToken, encryptRoomPayload, decryptRoomPayload } from '@crypto';
-import { MessageBuilder, ProfileBuilder, RoomBuilder } from '@builders';
-
-class TypedEventEmitter<Events extends Record<keyof Events, (...args: never[]) => unknown>> {
-  private _listeners = new Map<keyof Events, Set<(...args: never[]) => unknown>>();
-
-  on<K extends keyof Events>(event: K, listener: Events[K]): this {
-    let set = this._listeners.get(event);
-    if (!set) {
-      set = new Set();
-      this._listeners.set(event, set);
-    }
-    set.add(listener as unknown as (...args: never[]) => unknown);
-    return this;
-  }
-
-  once<K extends keyof Events>(event: K, listener: Events[K]): this {
-    const onceWrapper = ((...args: Parameters<Events[K]>) => {
-      this.off(event, onceWrapper);
-      (listener as unknown as (...args: unknown[]) => void)(...args);
-    }) as unknown as Events[K];
-    return this.on(event, onceWrapper);
-  }
-
-  off<K extends keyof Events>(event: K, listener: Events[K]): this {
-    const set = this._listeners.get(event);
-    if (set) {
-      set.delete(listener as unknown as (...args: never[]) => unknown);
-      if (set.size === 0) {
-        this._listeners.delete(event);
-      }
-    }
-    return this;
-  }
-
-  emit<K extends keyof Events>(event: K, ...args: Parameters<Events[K]>): boolean {
-    const set = this._listeners.get(event);
-    if (!set || set.size === 0) return false;
-    for (const listener of set) {
-      try {
-        (listener as unknown as (...args: unknown[]) => void)(...args);
-      } catch (err) {
-        console.error(`[QXChat.ts] Error in event listener for ${String(event)}:`, err);
-      }
-    }
-    return true;
-  }
-
-  removeAllListeners<K extends keyof Events>(event?: K): this {
-    if (event !== undefined) {
-      this._listeners.delete(event);
-    } else {
-      this._listeners.clear();
-    }
-    return this;
-  }
-}
+import {
+  OpCode,
+  PresenceStatus,
+  type APIMessage,
+  type ClientOptions,
+  type APIProfile,
+  Events,
+} from '../types';
+import { Room } from '../structures/Room';
+import { Message } from '../structures/Message';
+import {
+  sanitizeAndValidateUsername,
+  validateRoomId,
+  validateRoomTitle,
+  type Username,
+  type RoomId,
+  type RoomTitle,
+  type RoomNote,
+} from '../errors';
+import { generateRoomAccessToken } from '../crypto/e2ee';
+import { MessageBuilder, RoomBuilder } from '../builders';
+import { BaseClient } from './BaseClient';
+import { WebSocketManager } from './gateway/WebSocketManager';
+import { CacheManager } from './managers/CacheManager';
+import type { IActionClient } from '../structures/IActionClient';
 
 /**
- * High-performance selfbot client for the QXChat protocol.
+ * Class of the QxChat selfbot client.
  */
-export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
-  public readonly options: Required<ClientOptions>;
-  public ws: WebSocket | null = null;
+export class SelfbotClient extends BaseClient implements IActionClient {
+  /** WebSocket gateway manager. */
+  public ws!: WebSocketManager;
+  /** In-memory cache manager for rooms, keys, profiles and notes. */
+  public readonly cache: CacheManager;
 
-  // Connection states
-  public connected = false;
+  /** True when the WebSocket connection is established and open. */
+  public get connected(): boolean {
+    return this.ws.connected;
+  }
+  /** The ping latency of the WebSocket gateway connection in milliseconds. */
+  public get ping(): number {
+    return this.ws.ping;
+  }
+  /** True after a successful Identify exchange with the server. */
   public identified = false;
-  public userId = '';
-  public username = '' as Username;
-  public authToken = '';
+  /** Current presence status broadcast to other users. */
   public status: PresenceStatus = PresenceStatus.Online;
+  /** Whether to delete messages on leave. */
   public deleteMessagesOnLeave = false;
+  /** Whether the server clears local messages on leave. */
   public serverClearsLocalMessages = false;
 
-  // Backups and connection timings
-  private _reconnectAttempts = 0;
-  private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private _heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-  private _manualClose = false;
-
-  // Caching
-  public readonly roomKeys = new Map<RoomId, string>(); // roomId -> roomKey
-  public readonly roomRatchets = new Map<RoomId, number>(); // roomId -> ratchet counter
-  public readonly rooms = new Map<RoomId, Room>();
-  public readonly activeRoomsList: RoomId[] = [];
-  public readonly roomNotes = new Map<RoomId, RoomNote>(); // roomId -> private note
-  public readonly usersByRoom = new Map<RoomId, Username[]>(); // roomId -> usernames
-  public readonly profilesByUser = new Map<Username, APIProfile>(); // username -> raw profile
-  public readonly statusesByUser = new Map<Username, PresenceStatus>(); // username -> status
-  public readonly badgesByUser = new Map<Username, string[]>(); // username -> badges
-  public badges: string[] = []; // own badges
-  /** True if the current account has admin privileges. */
-  public isAdmin = false;
-
-  /**
-   * Fetches a session token by logging in with username and password.
-   * 
-   * @param username The QXChat account username.
-   * @param password The account password.
-   * @param apiBaseUrl Base API url. Defaults to 'https://qxch.at/app'.
-   * @returns The raw authentication token.
-   */
-  public static async fetchToken(
-    username: string,
-    password: string,
-    apiBaseUrl = 'https://qxch.at',
-    proxy?: string
-  ): Promise<string> {
-    const cleanUrl = apiBaseUrl.replace(/\/+$/, '');
-    const res = await fetch(`${cleanUrl}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        username: username.trim().toLowerCase(),
-        password
-      }),
-      proxy: proxy || undefined
-    });
-    const d = (await res.json().catch(() => ({}))) as { token?: string; error?: string; ok?: boolean };
-    if (!res.ok || d?.ok === false) {
-      throw new Error(d?.error || `Auth failed: ${res.status}`);
-    }
-    if (!d.token) {
-      throw new Error("Auth failed: No token returned");
-    }
-    return d.token;
-  }
+  public get roomKeys() { return this.cache.roomKeys; }
+  public get roomRatchets() { return this.cache.roomRatchets; }
+  public get rooms() { return this.cache.rooms; }
+  public get activeRoomsList() { return this.cache.activeRoomsList; }
+  public get roomNotes() { return this.cache.roomNotes; }
+  public get usersByRoom() { return this.cache.usersByRoom; }
+  public get profilesByUser() { return this.cache.profilesByUser; }
+  public get statusesByUser() { return this.cache.statusesByUser; }
+  public get badgesByUser() { return this.cache.badgesByUser; }
+  public get badges(): string[] { return this.cache.badges; }
+  public set badges(b: string[]) { this.cache.badges = b; }
 
   constructor(options: ClientOptions = {}) {
-    super();
-    this.options = {
-      wsUrl: options.wsUrl || 'wss://qxch.at/ws',
-      platform: options.platform || ClientPlatform.Desktop,
-      clientId: options.clientId || crypto.randomUUID(),
-      version: options.version || 'qxchat.ts',
-      autoReconnect: options.autoReconnect !== false,
-      minReconnectDelay: options.minReconnectDelay || 1000,
-      maxReconnectDelay: options.maxReconnectDelay || 30000,
-      proxy: options.proxy || ''
-    };
+    super(options);
+    this.cache = new CacheManager(this);
+    this.ws = new WebSocketManager(this);
     this._dnsPrefetch();
   }
 
   private _dnsPrefetch(): void {
     try {
-      const hostingSource = new URL(this.options.wsUrl).hostname;
+      const host = new URL(this.options.wsUrl).hostname;
       if (typeof Bun !== 'undefined' && Bun.dns && typeof Bun.dns.prefetch === 'function') {
-        Bun.dns.prefetch(hostingSource);
+        Bun.dns.prefetch(host);
       }
     } catch {}
   }
 
   /**
    * Connects to the WebSocket gateway using the selfbot account details.
-   * If only one parameter is provided, it is treated as the session token, and the username
-   * will be automatically fetched from the QXChat REST API `/api/auth/me`.
+   * If only one argument is provided, it is treated as the session token and
+   * the username will be automatically fetched from the QXChat REST API.
    *
    * @param {string} tokenOrUsername Session token (if 1 arg) or username (if 2 args).
-   * @param {string} [token] Raw authentication token (if 2 args).
-   * @returns {Promise<void>} Resolves when the connection starts.
-   * @throws {Error} If validation fails or fetching user profile fails.
+   * @param {string} [token] Raw authentication token (only when 2 args are given).
+   * @throws {Error} If the token is missing or invalid, or if the profile fetch fails.
    */
   public async login(tokenOrUsername: string, token?: string): Promise<void> {
     let activeUsername = '';
@@ -171,582 +93,164 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
 
     if (token === undefined) {
       activeToken = tokenOrUsername.trim();
-      if (!activeToken) throw new Error("QXChat: Authentication token is required.");
+      if (!activeToken) throw new Error('QXChat: Authentication token is required.');
 
-      const base = this.options.wsUrl.replace(/^ws/, 'http').replace(/\/ws$/, '');
-      const res = await fetch(`${base}/api/auth/me`, {
+      const res = await fetch(`${this.getApiBase()}/api/auth/me`, {
         headers: {
           'content-type': 'application/json',
-          'authorization': `Bearer ${activeToken}`
+          authorization: `Bearer ${activeToken}`,
         },
-        proxy: this.options.proxy || undefined
+        proxy: this.options.proxy || undefined,
       });
 
-      const d = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; user?: { username?: string } };
+      const d = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        user?: { username?: string };
+      };
       if (!res.ok || d?.ok === false) {
         throw new Error(d?.error || `Profile fetch failed during token-only login: HTTP ${res.status}`);
       }
 
       const fetched = d.user?.username || '';
       if (!fetched) {
-        throw new Error("QXChat: Server did not return a valid username for the provided token.");
+        throw new Error('QXChat: Server did not return a valid username for the provided token.');
       }
       activeUsername = fetched;
     } else {
       activeUsername = tokenOrUsername;
       activeToken = token.trim();
-      if (!activeToken) throw new Error("QXChat: Authentication token is required.");
+      if (!activeToken) throw new Error('QXChat: Authentication token is required.');
     }
 
     const cleanUsername = sanitizeAndValidateUsername(activeUsername);
     this.username = cleanUsername;
     this.authToken = activeToken;
-    this._manualClose = false;
     this._dnsPrefetch();
-    this._connect();
+    this.ws.connectGateway();
   }
 
   /**
    * Disconnects the selfbot from the gateway.
    */
   public logout(): void {
-    this._manualClose = true;
-    this._stopHeartbeat();
-    this._clearReconnectTimer();
-
-    if (this.ws) {
-      if (this.ws.readyState < WebSocket.CLOSING) {
-        this.ws.close();
-      }
-      this.ws = null;
-    }
-
-    this.connected = false;
     this.identified = false;
-    this.emit('disconnect', 'Manual logout called');
+    this.ws.disconnectGateway('Manual logout called');
+  }
+
+  private _send(op: OpCode, d: unknown): void {
+    this.ws.sendPayload(op, d);
   }
 
   /**
-   * Connection management
+   * Registers a room encryption key for a specific room.
+   * @param {RoomId | string} roomId The room ID.
+   * @param {string} roomKey The 32-byte hex room encryption key.
    */
-  private _connect() {
-    this._clearReconnectTimer();
-
-    if (this.ws) return;
-
-    try {
-      if (this.options.proxy) {
-        this.ws = new WebSocket(this.options.wsUrl, {
-          proxy: this.options.proxy
-        });
-      } else {
-        this.ws = new WebSocket(this.options.wsUrl);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.emit('error', new Error(`Connection failed: ${msg}`));
-      this._scheduleReconnect();
-      return;
-    }
-
-    this.ws.addEventListener('open', () => {
-      this.connected = true;
-      this._reconnectAttempts = 0;
-
-      const isMobile = this.options.platform === ClientPlatform.Mobile ||
-        this.options.platform === ClientPlatform.Android ||
-        this.options.platform === ClientPlatform.IOS;
-
-      // Send Identify payload
-      this._send(OpCode.Identify, {
-        username: this.username,
-        token: this.authToken,
-        isVoiceChat: false,
-        deleteMessagesOnLeave: false,
-        status: this.status,
-        clientId: this.options.clientId,
-        platform: this.options.platform,
-        v: this.options.version,
-        isMobile,
-        isSecure: true
-      });
-    });
-
-    this.ws.addEventListener('message', ({ data }) => {
-      try {
-        const payload = JSON.parse(data.toString());
-        this._handlePayload(payload);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.emit('error', new Error(`Malformed JSON payload received: ${msg}`));
-      }
-    });
-
-    this.ws.addEventListener('close', () => {
-      this.connected = false;
-      this.identified = false;
-      this.ws = null;
-      this._stopHeartbeat();
-
-      if (!this._manualClose) {
-        this.emit('disconnect', 'Gateway connection lost. Attempting reconnect...');
-        this._scheduleReconnect();
-      } else {
-        this.emit('disconnect', 'Disconnected');
-      }
-    });
-
-    this.ws.addEventListener('error', () => {
-      this.emit('error', new Error('Gateway WebSocket error observed.'));
-    });
-  }
-
-  private _scheduleReconnect() {
-    if (!this.options.autoReconnect || this._manualClose || this._reconnectTimer) return;
-
-    const minDelay = this.options.minReconnectDelay;
-    const maxDelay = this.options.maxReconnectDelay;
-    const delay = Math.min(maxDelay, minDelay * 2 ** Math.min(this._reconnectAttempts, 6));
-
-    this._reconnectAttempts++;
-    this._reconnectTimer = setTimeout(() => {
-      this._reconnectTimer = null;
-      this._connect();
-    }, delay);
-  }
-
-  private _clearReconnectTimer() {
-    if (this._reconnectTimer) {
-      clearTimeout(this._reconnectTimer);
-      this._reconnectTimer = null;
-    }
-  }
-
-  private _startHeartbeat(intervalMs: number) {
-    this._stopHeartbeat();
-    this._heartbeatInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this._send(OpCode.Heartbeat, {});
-      }
-    }, intervalMs);
-  }
-
-  private _stopHeartbeat() {
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-      this._heartbeatInterval = null;
-    }
-  }
-
-  private _send(op: OpCode, d: unknown) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ op, d }));
-    }
+  public registerRoomKey(roomId: RoomId | string, roomKey: string): void {
+    this.cache.registerRoomKey(roomId, roomKey);
   }
 
   /**
-   * Processes gateway packets.
+   * Parses and registers a 96-character room access invite token.
+   * @param {string} token The 96-char invite token.
+   * @returns {RoomId} The parsed room ID.
    */
-  private async _handlePayload(payload: GatewayPayload) {
-    const { op, d } = payload;
-    if (!d || typeof d !== 'object') return;
-    const data = d as Record<string, unknown>;
-
-    switch (op) {
-      case OpCode.Hello: {
-        const hello = d as HelloPayload;
-        if (hello?.heartbeat_interval) {
-          this._startHeartbeat(hello.heartbeat_interval);
-        }
-        break;
-      }
-      case OpCode.Identify: {
-        if (data.error) {
-          this.emit('error', new Error(`Identify failed: ${String(data.error)}`));
-          this.logout();
-          break;
-        }
-        this.userId = String(data.id || data.userId || data.uuid || '');
-        // Server may echo back username / admin flag in the ACK
-        if (data.username) this.username = String(data.username) as Username;
-        if (data.admin !== undefined) this.isAdmin = Boolean(data.admin);
-        if (Array.isArray(data.badges)) {
-          this.badges = data.badges.map(String);
-          if (this.username) {
-            this.badgesByUser.set(this.username.trim().toLowerCase() as Username, this.badges);
-          }
-        }
-        this.identified = true;
-        this.emit('ready', this);
-        break;
-      }
-      case OpCode.Message: {
-        if (data.error) break;
-        if (data.messageId && typeof data.timestamp === 'number') {
-          const rawMsg = d as APIMessage;
-          const msg = await this.decryptAndNormalizeMessage(rawMsg, rawMsg.roomId || rawMsg.gameId);
-          this.emit('message', msg);
-        }
-        break;
-      }
-      case OpCode.MessageEdited: {
-        if (data.messageId && typeof data.timestamp === 'number') {
-          const rawMsg = d as APIMessage;
-          const msg = await this.decryptAndNormalizeMessage(rawMsg, rawMsg.roomId || rawMsg.gameId);
-          this.emit('messageUpdate', msg);
-        }
-        break;
-      }
-      case OpCode.MessageDeleted: {
-        if (data.messageId && data.gameId) {
-          this.emit('messageDelete', {
-            roomId: String(data.gameId) as RoomId,
-            messageId: String(data.messageId)
-          });
-        }
-        break;
-      }
-      case OpCode.RoomMessagesDeleted: {
-        if (data.gameId && Array.isArray(data.messageIds)) {
-          this.emit('roomMessagesClear', {
-            roomId: String(data.gameId) as RoomId,
-            messageIds: (data.messageIds as unknown[]).map(String)
-          });
-        }
-        break;
-      }
-      case OpCode.Join: {
-        const roomPayload = data.room as Record<string, unknown> | undefined;
-        const roomId = String(roomPayload?.room_id || roomPayload?.roomId || data.gameId || '');
-        if (roomId) {
-          const room = this._updateRoomCache(data);
-          if (data.joined) {
-            const username = String(data.joined) as Username;
-            const currentUsers = this.usersByRoom.get(roomId as RoomId) || [];
-            if (!currentUsers.includes(username)) {
-              currentUsers.push(username);
-              this.usersByRoom.set(roomId as RoomId, currentUsers);
-              if (!room.members.includes(username)) {
-                room.members.push(username);
-              }
-            }
-            this.emit('userJoin', { roomId: roomId as RoomId, username: username as Username });
-          } else if (data.ok && !data.system) {
-            this.emit('roomUpdate', room);
-          }
-        }
-        break;
-      }
-      case OpCode.Leave: {
-        const roomPayload = data.room as Record<string, unknown> | undefined;
-        const roomId = roomPayload?.room_id || roomPayload?.roomId || data.gameId;
-        if (roomId) {
-          const roomIdStr = String(roomId) as RoomId;
-          if (data.ok) {
-            this.rooms.delete(roomIdStr);
-            const idx = this.activeRoomsList.indexOf(roomIdStr);
-            if (idx !== -1) this.activeRoomsList.splice(idx, 1);
-            this.usersByRoom.delete(roomIdStr);
-          } else if (data.left) {
-            const username = String(data.left) as Username;
-            const currentUsers = this.usersByRoom.get(roomIdStr) || [];
-            this.usersByRoom.set(roomIdStr, currentUsers.filter(u => u !== username));
-            const room = this.rooms.get(roomIdStr);
-            if (room) {
-              room.members = room.members.filter(u => u !== username);
-            }
-            this.emit('userLeave', {
-              roomId: roomIdStr as RoomId,
-              username: username as Username
-            });
-          }
-        }
-        break;
-      }
-      case OpCode.Typing: {
-        if (data.gameId && data.username) {
-          const roomId = String(data.gameId);
-          const username = String(data.username);
-          if (data.typing) {
-            this.emit('typingStart', { roomId: roomId as RoomId, username: username as Username });
-          } else {
-            this.emit('typingEnd', { roomId: roomId as RoomId, username: username as Username });
-          }
-        }
-        break;
-      }
-      case OpCode.PresenceStatus: {
-        if (data.user) {
-          const username = String(data.user) as Username;
-          const status = (String(data.status || 'online') as PresenceStatus) || PresenceStatus.Online;
-          this.statusesByUser.set(username, status);
-          if (data.profile) {
-            const existing = this.profilesByUser.get(username) || {};
-            this.profilesByUser.set(username, { ...existing, ...(data.profile as APIProfile) });
-          }
-          this.emit('presenceUpdate', {
-            username,
-            status
-          });
-        }
-        break;
-      }
-      case OpCode.ProfileUpdate: {
-        const user = String(data.user || '') as Username;
-        if (user) {
-          const incomingProfile = data.profile as APIProfile | undefined;
-          if (incomingProfile) {
-            const existing = this.profilesByUser.get(user) || {};
-            this.profilesByUser.set(user, { ...existing, ...incomingProfile });
-          }
-          this._updateRoomCache(data);
-          this.emit('profileUpdate', { username: user, profile: this.profilesByUser.get(user) || {} });
-        }
-        break;
-      }
-      case OpCode.RoomSnapshot:
-      case OpCode.RoomSnapshotPreserveTitle: {
-        const room = this._updateRoomCache(data);
-        this.emit('roomUpdate', room);
-        break;
-      }
-      case OpCode.ReactionSync: {
-        if (data.messageId && data.gameId) {
-          this.emit('messageReactionUpdate', {
-            roomId: String(data.gameId) as RoomId,
-            messageId: String(data.messageId),
-            reactions: Array.isArray(data.reactions) ? data.reactions.map(String) : []
-          });
-        }
-        break;
-      }
-      case OpCode.Error: {
-        if (data.error) {
-          this.emit('error', new Error(`Server Error: ${String(data.error)}`));
-        }
-        break;
-      }
-      default:
-        break;
-    }
+  public registerRoomToken(token: string): RoomId {
+    return this.cache.registerRoomToken(token);
   }
 
   /**
-   * Registers a 16-byte hex room key for a specific Room ID.
+   * Decrypts and normalizes a raw API message into a Message instance.
+   * @param {APIMessage} rawMessage Raw server message object.
+   * @param {RoomId | string} [fallbackRoomId] Room ID to use if not in payload.
+   * @returns {Promise<Message>} Normalized Message instance.
    */
-  public registerRoomKey(roomId: string, roomKey: string): void {
-    const cleanRoomId = validateRoomId(roomId);
-    this.roomKeys.set(cleanRoomId, roomKey);
+  public decryptAndNormalizeMessage(rawMessage: APIMessage, fallbackRoomId?: RoomId | string): Promise<Message> {
+    return this.cache.decryptAndNormalizeMessage(rawMessage, fallbackRoomId);
   }
 
   /**
-   * Registers an E2EE room token, parsing the Room ID and Room Key automatically.
+   * Finds all rooms shared between the current user and another user.
+   * @param {Username | string} username Target username.
+   * @returns {Room[]} Shared rooms.
    */
-  public registerRoomToken(token: string): string {
-    const { roomId, roomKey } = parseRoomAccessToken(token);
-    this.registerRoomKey(roomId, roomKey);
-    return roomId;
+  public mutualRoomsWith(username: Username | string): Room[] {
+    return this.cache.mutualRoomsWith(username);
   }
 
   /**
-   * Cache managers
+   * Retrieves a user's cached profile.
+   * @param {Username | string} username Target username.
+   * @returns {APIProfile | null} Profile or null if not cached.
    */
-  private _updateRoomCache(d: unknown): Room {
-    const data = d as Record<string, unknown>;
-    const roomPayload = data.room as Record<string, unknown> | undefined;
-    const roomId = String(roomPayload?.room_id || roomPayload?.roomId || data.gameId || '') as RoomId;
-    if (!roomId) throw new Error("QXChat: Missing room ID in snapshot.");
-
-    let room = this.rooms.get(roomId);
-    const title = String(roomPayload?.title || data.title || room?.title || roomId);
-
-    const iconPayload = roomPayload?.icon as Record<string, unknown> | undefined;
-    const filePayload = iconPayload?.file as Record<string, unknown> | undefined;
-    const iconUrl = String(filePayload?.url || iconPayload?.url || roomPayload?.iconUrl || data.iconUrl || room?.iconUrl || '');
-
-    const members = Array.isArray(roomPayload?.members)
-      ? (roomPayload.members as Array<Record<string, unknown> | string>).map((m) =>
-        typeof m === 'object' && m ? String(m.username || m.user || '') : String(m)
-      )
-      : room?.members || [];
-
-    const lastPreview = String(roomPayload?.lastPreview || room?.lastPreview || '');
-    const lastTimestamp = Number(roomPayload?.lastTimestamp || room?.lastTimestamp || 0);
-    const lastSender = String(roomPayload?.lastSender || room?.lastSender || '');
-
-    if (room) {
-      room.title = title as RoomTitle;
-      room.iconUrl = iconUrl;
-      room.members = members as Username[];
-      room.lastPreview = lastPreview;
-      room.lastTimestamp = lastTimestamp;
-      room.lastSender = lastSender as Username;
-    } else {
-      room = new Room(this, roomId as RoomId, title as RoomTitle, iconUrl, members as Username[], lastPreview, lastTimestamp, lastSender as Username);
-      this.rooms.set(roomId as RoomId, room);
-    }
-
-    if (!this.activeRoomsList.includes(roomId as RoomId)) {
-      this.activeRoomsList.push(roomId as RoomId);
-    }
-
-    if (Array.isArray(data.players)) {
-      const players = (data.players as Array<Record<string, unknown> | string>).map(p => {
-        if (typeof p === 'object' && p) {
-          const username = String(p.username || p.user || '').trim().toLowerCase() as Username;
-          if (username && Array.isArray(p.badges)) {
-            this.badgesByUser.set(username, p.badges.map(String));
-          }
-          return String(p.username || p.user || '') as Username;
-        }
-        return String(p) as Username;
-      });
-      this.usersByRoom.set(roomId as RoomId, players);
-    } else if (roomPayload) {
-      this.usersByRoom.set(roomId as RoomId, members as Username[]);
-    }
-
-    if (data.profiles && typeof data.profiles === 'object') {
-      for (const [username, profile] of Object.entries(data.profiles as Record<string, unknown>)) {
-        const key = username.trim().toLowerCase() as Username;
-        if (key && profile && typeof profile === 'object') {
-          const existing = this.profilesByUser.get(key) || {};
-          this.profilesByUser.set(key, { ...existing, ...(profile as APIProfile) });
-        }
-      }
-    }
-
-    if (data.statuses && typeof data.statuses === 'object') {
-      for (const [username, status] of Object.entries(data.statuses as Record<string, string>)) {
-        const key = username.trim().toLowerCase() as Username;
-        if (key && status) {
-          this.statusesByUser.set(key, status as PresenceStatus);
-        }
-      }
-    }
-
-    if (this.username) {
-      const ownBadges = this.badgesByUser.get(this.username.trim().toLowerCase() as Username);
-      if (ownBadges) {
-        this.badges = ownBadges;
-      }
-    }
-
-    return room;
+  public getUserProfile(username: Username | string): APIProfile | null {
+    return this.cache.getUserProfile(username);
   }
 
   /**
-   * Normalization + Decryption helper
+   * Gets the cached member list for a room.
+   * @param {RoomId | string} roomId Target room ID.
+   * @returns {Username[]} Member username list.
    */
-  public async decryptAndNormalizeMessage(rawMessage: APIMessage, fallbackRoomId?: string): Promise<Message> {
-    const roomId = rawMessage.roomId || rawMessage.gameId || fallbackRoomId || '';
-    const envelope = rawMessage.encrypted;
-
-    if (!envelope) {
-      return this._normalizeMessageRaw(rawMessage, roomId, false);
-    }
-
-    const roomKey = this.roomKeys.get(roomId as RoomId);
-    if (!roomKey) {
-      return this._normalizeMessageRaw(rawMessage, roomId as RoomId, true); // Retain encrypted placeholder
-    }
-
-    try {
-      const decrypted = (await decryptRoomPayload(roomKey, roomId, envelope)) as {
-        text?: string;
-        attachment?: APIAttachment | null;
-        replyToMessageId?: string | null;
-      };
-      return this._normalizeMessageRaw({
-        ...rawMessage,
-        text: decrypted?.text,
-        attachment: decrypted?.attachment,
-        replyToMessageId: decrypted?.replyToMessageId || rawMessage.replyToMessageId,
-      }, roomId, false);
-    } catch (err) {
-      console.error(`Decryption failed for room ${roomId}:`, err);
-      console.error(`Key: "${roomKey}"`);
-      console.error(`Envelope:`, JSON.stringify(envelope, null, 2));
-      return this._normalizeMessageRaw(rawMessage, roomId, true);
-    }
+  public getRoomMembers(roomId: RoomId | string): Username[] {
+    return this.cache.getRoomMembers(roomId);
   }
-
-  private _normalizeMessageRaw(message: APIMessage, fallbackRoomId: string, locked: boolean): Message {
-    const text = message.text || (locked ? 'Encrypted message' : '');
-    const attachment = message.attachment ? {
-      id: String(message.attachment.id || '').trim(),
-      url: message.attachment.url || '',
-      filename: message.attachment.filename || 'file',
-      mimeType: message.attachment.mimeType || 'application/octet-stream',
-      size: Number(message.attachment.size) || 0,
-      dataB64: message.attachment.dataB64 || '',
-    } : null;
-
-    let kind: MessageKind = MessageKind.Text;
-    if (message.deleted) kind = MessageKind.Deleted;
-    else if (attachment) {
-      const mime = (attachment.mimeType || '').toLowerCase();
-      if (mime.startsWith('audio/')) kind = MessageKind.Audio;
-      else if (mime.startsWith('image/')) kind = MessageKind.Image;
-      else if (mime.startsWith('video/')) kind = MessageKind.Video;
-      else kind = MessageKind.File;
-    }
-
-    const username = message.username || message.user || 'Unknown';
-
-    return new Message(this, {
-      messageId: message.messageId,
-      roomId: (message.roomId || message.gameId || fallbackRoomId) as RoomId,
-      user: message.user || 'Unknown',
-      username: username as Username,
-      text,
-      rawText: text,
-      timestamp: message.timestamp || Date.now(),
-      system: Boolean(message.system),
-      deleted: Boolean(message.deleted),
-      reactions: Array.isArray(message.reactions) ? message.reactions : [],
-      replyToMessageId: message.replyToMessageId || '',
-      attachment,
-      encrypted: message.encrypted || null,
-      preview: message.preview || null,
-      kind,
-      voiceDuration: null,
-      jumboEmoji: false,
-      locked,
-      editedAt: message.editedAt || 0,
-      mentioned: Boolean(message.mentioned),
-    });
-  }
-
 
   /**
-   * Joins a room using a token (derives E2EE key) or raw room ID.
-   *
+   * Exports the full client session state as a JSON string.
+   * @returns {string} Snapshot JSON.
+   */
+  public exportSnapshot(): string {
+    return this.cache.exportSnapshot();
+  }
+
+  /**
+   * Restores client caches from a previously exported snapshot string.
+   * @param {string} json Snapshot JSON.
+   */
+  public importSnapshot(json: string): void {
+    this.cache.importSnapshot(json);
+  }
+
+  /**
+   * Sets a local client-side note for a room.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {RoomNote | string} note Note text.
+   */
+  public setRoomNote(roomId: RoomId | string, note: RoomNote | string): void {
+    this.cache.setRoomNote(roomId, note);
+  }
+
+  /**
+   * Gets the local client-side note for a room.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @returns {RoomNote} Note text or empty string.
+   */
+  public getRoomNote(roomId: RoomId | string): RoomNote {
+    return this.cache.getRoomNote(roomId);
+  }
+
+  /**
+   * Joins a room using an invite token (derives E2EE key) or raw room ID.
    * @param {string} tokenOrRoomId 96-char room access invite token or 32-char hex room ID.
-   * @param {object} [options] Connection options.
-   * @param {boolean} [options.silentJoin] True to join without broadcasting a presence packet.
-   * @returns {Promise<void>} Resolves when the join message is dispatched.
-   * @throws {Error} If ID format is invalid.
+   * @param {{ silentJoin?: boolean }} [options] Join options.
    */
   public async joinRoom(tokenOrRoomId: string, options?: { silentJoin?: boolean }): Promise<void> {
     let roomId = tokenOrRoomId;
     if (tokenOrRoomId.length === 96) {
       roomId = this.registerRoomToken(tokenOrRoomId);
     }
-
     validateRoomId(roomId);
     this._send(OpCode.Join, {
       gameId: roomId,
-      silentJoin: options?.silentJoin === true
+      silentJoin: options?.silentJoin === true,
     });
   }
 
   /**
    * Leaves a room.
-   *
-   * @param {string} roomId The room ID.
-   * @returns {Promise<void>} Resolves when the leave payload is dispatched.
-   * @throws {Error} If roomId check fails.
+   * @param {RoomId | string} roomId The room ID.
    */
   public async leaveRoom(roomId: RoomId | string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
@@ -754,12 +258,9 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
   }
 
   /**
-   * Sends a message to a room. Automatically E2EE encrypts the message if a key is registered.
-   *
-   * @param {string} roomId The room ID.
+   * Sends a message to a room. Automatically E2EE-encrypts if a key is registered.
+   * @param {RoomId | string} roomId The room ID.
    * @param {string | MessageBuilder} content Message body text or MessageBuilder instance.
-   * @returns {Promise<void>} Resolves when message has been encrypted and sent.
-   * @throws {Error} If validation fails or encryption fails.
    */
   public async sendMessage(roomId: RoomId | string, content: string | MessageBuilder): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
@@ -770,404 +271,147 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
       const nextCounter = Math.max(0, Math.floor(this.roomRatchets.get(cleanRoomId) || 0)) + 1;
       this.roomRatchets.set(cleanRoomId, nextCounter);
       const encrypted = await builder.toEncrypted(key, cleanRoomId, nextCounter);
-      this._send(OpCode.Message, {
-        gameId: cleanRoomId,
-        encrypted
-      });
+      this._send(OpCode.Message, { gameId: cleanRoomId, encrypted });
     } else {
       this._send(OpCode.Message, {
-        text: builder.text,
         gameId: cleanRoomId,
-        attachment: builder.attachment,
-        replyToMessageId: builder.replyToMessageId
+        text: builder.text,
+        replyToMessageId: builder.replyToMessageId || undefined,
+        attachment: builder.attachment || undefined,
       });
     }
   }
 
   /**
-   * Edits an existing message. Automatically E2EE encrypts if key is registered.
-   *
-   * @param {string} roomId The room ID containing the message.
-   * @param {string} messageId UUID of the target message to edit.
-   * @param {string} content The new text body.
-   * @returns {Promise<void>} Resolves when the edit payload is sent.
-   * @throws {Error} If validation fails.
+   * Edits an existing message in a room. Encrypts the payload if an E2EE key is registered.
+   * @param {RoomId | string} roomId The room ID.
+   * @param {string} messageId ID of the message to edit.
+   * @param {string | MessageBuilder} content New message body text or MessageBuilder instance.
    */
-  public async editMessage(roomId: RoomId | string, messageId: string, content: string): Promise<void> {
+  public async editMessage(
+    roomId: RoomId | string,
+    messageId: string,
+    content: string | MessageBuilder
+  ): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
+    const builder = content instanceof MessageBuilder ? content : new MessageBuilder(content);
     const key = this.roomKeys.get(cleanRoomId);
 
     if (key) {
       const nextCounter = Math.max(0, Math.floor(this.roomRatchets.get(cleanRoomId) || 0)) + 1;
       this.roomRatchets.set(cleanRoomId, nextCounter);
-      const encrypted = await encryptRoomPayload(key, cleanRoomId, { text: content, attachment: null }, nextCounter);
-      this._send(OpCode.EditMessage, {
-        messageId,
-        gameId: cleanRoomId,
-        encrypted
-      });
+      const encrypted = await builder.toEncrypted(key, cleanRoomId, nextCounter);
+      this._send(OpCode.EditMessage, { gameId: cleanRoomId, messageId, encrypted });
     } else {
       this._send(OpCode.EditMessage, {
-        messageId,
         gameId: cleanRoomId,
-        text: content
+        messageId,
+        text: builder.text,
+        attachment: builder.attachment || undefined,
       });
     }
   }
 
   /**
-   * Deletes a message.
-   *
-   * @param {string} roomId The room ID containing the message.
-   * @param {string} messageId UUID of the message to delete.
-   * @returns {Promise<void>} Resolves when delete command is dispatched.
-   * @throws {Error} If validation fails.
+   * Deletes a message from a room.
+   * Uses OpCode.DeleteMessage (21) — NOT Message (7) — as required by the server protocol.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {string} messageId ID of message to delete.
    */
   public async deleteMessage(roomId: RoomId | string, messageId: string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
-    this._send(OpCode.DeleteMessage, {
-      messageId,
-      gameId: cleanRoomId
-    });
+    this._send(OpCode.DeleteMessage, { gameId: cleanRoomId, messageId });
   }
 
   /**
-   * Sends typing status indicator to a room.
-   *
-   * @param {string} roomId Associated room ID.
-   * @param {boolean} typing True to show typing indicator, false to hide.
-   * @returns {Promise<void>} Resolves when typing status packet is dispatched.
-   * @throws {Error} If validation fails.
+   * Sends a typing indicator status to a room.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {boolean} typing True if typing, false if stopped.
    */
   public async sendTyping(roomId: RoomId | string, typing: boolean): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
-    this._send(OpCode.Typing, {
-      gameId: cleanRoomId,
-      typing
-    });
+    this._send(OpCode.Typing, { gameId: cleanRoomId, typing: Boolean(typing) });
   }
 
   /**
-   * Edits the room title (OpCode 33).
-   *
-   * @param {string} roomId Associated room ID.
-   * @param {string | RoomBuilder} title New title string or RoomBuilder instance.
-   * @returns {Promise<void>} Resolves when title update message is sent.
-   * @throws {Error} If validation fails.
+   * Updates the title of a room.
+   * Uses OpCode.RoomSnapshot (33) = update_room_title on the server.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {RoomTitle | RoomBuilder | string} title New title string or RoomBuilder.
    */
-  public async setRoomTitle(roomId: RoomId | string, title: RoomTitle | RoomBuilder | string): Promise<void> {
+  public async setRoomTitle(
+    roomId: RoomId | string,
+    title: RoomTitle | RoomBuilder | string
+  ): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
-    const cleanTitle = title instanceof RoomBuilder ? title.title : (title as RoomTitle);
-    validateRoomTitle(cleanTitle);
-
-    this._send(OpCode.RoomSnapshot, {
-      gameId: cleanRoomId,
-      title: cleanTitle
-    });
+    const rawTitle = title instanceof RoomBuilder ? title.title : title;
+    const cleanTitle = validateRoomTitle(rawTitle);
+    this._send(OpCode.RoomSnapshot, { gameId: cleanRoomId, title: cleanTitle });
   }
 
   /**
-   * Fetches history of a room.
-   *
-   * @param {string} roomId Associated room ID.
-   * @returns {Promise<void>} Resolves when request is sent.
-   * @throws {Error} If validation fails.
+   * Requests previous message history for a room.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {number} [_limit] Unused (server controls limit). Kept for API compat.
+   * @param {string} [_beforeMessageId] Unused (server controls pagination). Kept for API compat.
    */
-  public async fetchHistory(roomId: RoomId | string): Promise<void> {
+  public async fetchHistory(roomId: RoomId | string, _limit = 50, _beforeMessageId?: string): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
     this._send(OpCode.History, { gameId: cleanRoomId });
   }
 
   /**
-   * Modifies account profile status details.
-   *
-   * @param {ProfileBuilder} profile Configured profile payload builder.
-   * @returns {Promise<void>} Resolves when settings sync packet is sent.
+   * Requests a link preview update for a message URL.
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {string} messageId Target message ID.
+   * @param {string} url The URL to preview.
    */
-  public async updateProfile(profile: ProfileBuilder): Promise<void> {
+  public async requestLinkPreview(roomId: RoomId | string, messageId: string, url: string): Promise<void> {
+    const cleanRoomId = validateRoomId(roomId);
+    this._send(OpCode.RequestLinkPreview, { gameId: cleanRoomId, messageId, url });
+  }
+
+  /**
+   * Updates the client's presence status.
+   * @param {PresenceStatus | 'online' | 'idle' | 'dnd' | 'offline'} status Next presence status.
+   */
+  public async updatePresence(status: PresenceStatus | 'online' | 'idle' | 'dnd' | 'offline'): Promise<void> {
+    this.status = status as PresenceStatus;
     this._send(OpCode.SyncClientSettings, {
-      status: this.status,
-      deleteMessagesOnLeave: this.deleteMessagesOnLeave,
-      serverClearsLocalMessages: this.serverClearsLocalMessages,
+      status: String(status),
       clientId: this.options.clientId,
-      platform: this.options.platform,
-      profile: profile.toJSON()
     });
   }
 
   /**
-   * Updates presence status (e.g. online, invisible, dnd).
-   *
-   * @param {PresenceStatus | 'online' | 'invisible' | 'dnd'} status Target presence state.
-   * @param {ProfileBuilder} [profile] Optional profile updates builder.
-   * @returns {Promise<void>} Resolves when status update packet is sent.
+   * Publishes profile changes to the QXChat network.
+   * @param {Partial<APIProfile>} profile User profile properties to update.
    */
-  public async updatePresence(
-    status: PresenceStatus | 'online' | 'invisible' | 'dnd',
-    profile?: ProfileBuilder
-  ): Promise<void> {
-    this.status = status as PresenceStatus;
-    this._send(OpCode.SyncClientSettings, {
-      status,
-      deleteMessagesOnLeave: this.deleteMessagesOnLeave,
-      serverClearsLocalMessages: this.serverClearsLocalMessages,
-      clientId: this.options.clientId,
-      platform: this.options.platform,
-      profile: profile ? profile.toJSON() : undefined
-    });
+  public async updateProfile(profile: Partial<APIProfile>): Promise<void> {
+    this._send(OpCode.ProfileUpdate, { profile });
   }
 
   /**
    * Toggles a reaction emoji on a message.
-   *
-   * @param {string} roomId Associated room ID.
-   * @param {string} messageId Target message UUID.
-   * @param {string} emoji Emoji character string to toggle.
-   * @returns {Promise<void>} Resolves when reaction update packet is sent.
-   * @throws {Error} If validation fails.
+   * Uses OpCode.ReactionSend (19) — NOT ReactionSync (20, which is server→client).
+   * @param {RoomId | string} roomId Associated room ID.
+   * @param {string} messageId Target message ID.
+   * @param {string | string[]} emojis Reaction emoji(s) to toggle.
    */
-  public async toggleReaction(roomId: RoomId | string, messageId: string, emoji: string): Promise<void> {
-    const cleanRoomId = validateRoomId(roomId);
-    this._send(OpCode.ReactionSend, {
-      messageId,
-      reaction: emoji,
-      gameId: cleanRoomId
-    });
-  }
-
-  /**
-   * Uploads a profile image (avatar or banner).
-   *
-   * @param {ProfileImageKind | 'avatar' | 'banner'} kind Image type.
-   * @param {Uint8Array | ArrayBuffer | Blob} fileBuffer File binary buffer.
-   * @param {string} [filename='image.png'] Optional name of file.
-   * @returns {Promise<void>} Resolves when upload completes.
-   * @throws {Error} If not logged in or upload fails.
-   */
-  public async uploadProfileImage(
-    kind: ProfileImageKind | 'avatar' | 'banner',
-    fileBuffer: Uint8Array | ArrayBuffer | Blob,
-    filename = 'image.png'
-  ): Promise<void> {
-    if (!this.authToken) throw new Error("QXChat: Not logged in.");
-
-    const form = new FormData();
-    form.append('kind', kind);
-    const blob = fileBuffer instanceof Blob ? fileBuffer : new Blob([fileBuffer]);
-    form.append('file', blob, filename);
-
-    const base = this.options.wsUrl.replace(/^ws/, 'http').replace(/\/ws$/, '');
-    const res = await fetch(`${base}/api/profile/image`, {
-      method: 'POST',
-      headers: { 'authorization': `Bearer ${this.authToken}` },
-      body: form,
-      proxy: this.options.proxy || undefined
-    });
-
-    const d = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-    if (!res.ok || d?.ok === false) {
-      throw new Error(d?.error || `Upload failed: ${res.status}`);
-    }
-  }
-
-  /**
-   * Uploads a room icon image.
-   *
-   * @param {string} roomId Associated room ID.
-   * @param {Uint8Array | ArrayBuffer | Blob} fileBuffer File payload buffer.
-   * @param {string} [filename='icon.png'] Optional name for the file.
-   * @returns {Promise<string>} The new icon URL path.
-   * @throws {Error} If not logged in, validation fails, or upload fails.
-   */
-  public async uploadRoomIcon(
+  public async toggleReaction(
     roomId: RoomId | string,
-    fileBuffer: Uint8Array | ArrayBuffer | Blob,
-    filename = 'icon.png'
-  ): Promise<string> {
-    if (!this.authToken) throw new Error("QXChat: Not logged in.");
-
+    messageId: string,
+    emojis: string | string[]
+  ): Promise<void> {
     const cleanRoomId = validateRoomId(roomId);
-    const form = new FormData();
-    const blob = fileBuffer instanceof Blob ? fileBuffer : new Blob([fileBuffer]);
-    form.append('file', blob, filename);
-
-    const base = this.options.wsUrl.replace(/^ws/, 'http').replace(/\/ws$/, '');
-    const res = await fetch(`${base}/api/rooms/${encodeURIComponent(cleanRoomId)}/icon`, {
-      method: 'POST',
-      headers: { 'authorization': `Bearer ${this.authToken}` },
-      body: form,
-      proxy: this.options.proxy || undefined
-    });
-
-    const d = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; room?: { icon?: { url?: string; file?: { url?: string } } } };
-    if (!res.ok || d?.ok === false) {
-      throw new Error(d?.error || `Upload failed: ${res.status}`);
-    }
-
-    const url = d.room?.icon?.url || d.room?.icon?.file?.url || '';
-    if (!url) throw new Error("Server did not return a valid room icon URL");
-    return url;
+    const list = Array.isArray(emojis) ? emojis.map(String) : [String(emojis)];
+    this._send(OpCode.ReactionSend, { gameId: cleanRoomId, messageId, reactions: list });
   }
 
   /**
-   * Sends a JSON request to the QXChat REST API, authenticated with the current token.
-   *
-   * @param {string} path Endpoint URI path.
-   * @param {RequestInit} [init] standard fetch configuration.
-   * @returns {Promise<Record<string, unknown>>} JSON response data.
-   * @throws {Error} If fetch fails or response.ok is false.
-   */
-  private async _apiRequest(path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
-    const base = this.options.wsUrl.replace(/^ws/, 'http').replace(/\/ws$/, '');
-    const res = await fetch(`${base}${path}`, {
-      ...init,
-      headers: {
-        'content-type': 'application/json',
-        ...(this.authToken ? { 'authorization': `Bearer ${this.authToken}` } : {}),
-        ...(init.headers as Record<string, string> | undefined ?? {})
-      },
-      proxy: this.options.proxy || undefined
-    });
-    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!res.ok || data?.ok === false) {
-      throw new Error(String(data?.error ?? `HTTP ${res.status}`));
-    }
-    return data;
-  }
-
-  /**
-   * Registers a new account. Returns the session token.
-   *
-   * @param {string} username The desired account username.
-   * @param {string} password The account password.
-   * @param {string} [apiBaseUrl='https://qxch.at'] Gateway base web server URL.
-   * @returns {Promise<string>} Session token.
-   * @throws {Error} If registration fails.
-   */
-  public static async register(
-    username: Username | string,
-    password: string,
-    apiBaseUrl = 'https://qxch.at',
-    proxy?: string
-  ): Promise<string> {
-    const base = apiBaseUrl.replace(/\/+$/, '');
-    const res = await fetch(`${base}/api/auth/register`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: username.trim().toLowerCase(), password }),
-      proxy: proxy || undefined
-    });
-    const d = (await res.json().catch(() => ({}))) as { token?: string; ok?: boolean; error?: string };
-    if (!res.ok || d?.ok === false) throw new Error(d?.error ?? `Registration failed: ${res.status}`);
-    if (!d.token) throw new Error("Registration failed: No token returned");
-    return d.token;
-  }
-
-  /**
-   * Recovers an account using the recovery word list.
-   *
-   * @param {string} username The account username.
-   * @param {string} recoveryWords The recovery phrase from account creation.
-   * @param {string} newPassword The new password to set.
-   * @param {string} [apiBaseUrl='https://qxch.at'] Gateway base web server URL.
-   * @returns {Promise<string>} Session token.
-   * @throws {Error} If recovery fails.
-   */
-  public static async recoverAccount(
-    username: Username | string,
-    recoveryWords: string,
-    newPassword: string,
-    apiBaseUrl = 'https://qxch.at',
-    proxy?: string
-  ): Promise<string> {
-    const base = apiBaseUrl.replace(/\/+$/, '');
-    const res = await fetch(`${base}/api/auth/recover`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        username: username.trim().toLowerCase(),
-        recoveryWords,
-        newPassword
-      }),
-      proxy: proxy || undefined
-    });
-    const d = (await res.json().catch(() => ({}))) as { token?: string; ok?: boolean; error?: string };
-    if (!res.ok || d?.ok === false) throw new Error(d?.error ?? `Recovery failed: ${res.status}`);
-    if (!d.token) throw new Error("Recovery failed: No token returned");
-    return d.token;
-  }
-
-  /**
-   * Changes the username of the currently logged-in account.
-   *
-   * @param {string} newUsername Valid new username.
-   * @returns {Promise<void>} Resolves when the name change succeeds.
-   * @throws {Error} If not logged in or validation/request fails.
-   */
-  public async changeUsername(newUsername: Username | string): Promise<void> {
-    if (!this.authToken) throw new Error("QXChat: Not logged in.");
-    const clean = sanitizeAndValidateUsername(newUsername);
-    const data = await this._apiRequest('/api/auth/username', {
-      method: 'POST',
-      body: JSON.stringify({ username: clean })
-    });
-    const nextUsername = String((data.user as Record<string, unknown>)?.username ?? clean);
-    this.username = nextUsername as Username;
-  }
-
-  /**
-   * Permanently deletes the currently logged-in account.
-   * Disconnects after deletion.
-   *
-   * @param {string} password The account password to confirm deletion.
-   * @returns {Promise<void>} Resolves when account deletion completes.
-   * @throws {Error} If not logged in or password check fails.
-   */
-  public async deleteAccount(password: string): Promise<void> {
-    if (!this.authToken) throw new Error("QXChat: Not logged in.");
-    await this._apiRequest('/api/auth/delete', {
-      method: 'POST',
-      body: JSON.stringify({ password })
-    });
-    this.logout();
-  }
-
-  /**
-   * Refreshes the session from the server, confirming the current token is still valid.
-   *
-   * @returns {Promise<string>} The username from the refreshed session.
-   * @throws {Error} If not logged in or session is invalid.
-   */
-  public async refreshSession(): Promise<string> {
-    if (!this.authToken) throw new Error("QXChat: Not logged in.");
-    const data = await this._apiRequest('/api/auth/me');
-    const username = String((data.user as Record<string, unknown>)?.username ?? this.username);
-    this.username = username as Username;
-    return username;
-  }
-
-  /**
-   * Logs out the user session from the server (revokes token) and cleans up client connection.
-   * 
-   * @returns {Promise<void>} Resolves when logout completes.
-   */
-  public async logoutAccount(): Promise<void> {
-    if (this.authToken) {
-      try {
-        await this._apiRequest('/api/auth/logout', { method: 'POST' });
-      } catch {
-        // ignore
-      }
-    }
-    this.logout();
-  }
-
-  /**
-   * Generates a new E2EE room access token locally, registers the room key, joins it, and sets its title if provided.
-   *
-   * @param {string} [title] Optional room title.
-   * @returns {Promise<Room>} The created room instance.
-   * @throws {Error} If join or metadata set fails.
+   * Generates a new E2EE room, registers the key, joins it, and optionally sets its title.
+   * @param {RoomTitle | string} [title] Optional room title.
+   * @returns {Promise<Room>} The created Room instance.
    */
   public async createRoom(title?: RoomTitle | string): Promise<Room> {
     const { roomId, roomKey } = generateRoomAccessToken();
@@ -1176,7 +420,7 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
 
     let room = this.rooms.get(roomId);
     if (!room) {
-      room = new Room(this, roomId, (title || '') as RoomTitle);
+      room = new Room(this, { roomId, title: title || '', iconUrl: '', members: [] });
       this.rooms.set(roomId, room);
     }
     if (title) {
@@ -1184,216 +428,4 @@ export class SelfbotClient extends TypedEventEmitter<ClientEvents> {
     }
     return room;
   }
-
-  /**
-   * Sets a local client-side note for a room.
-   *
-   * @param {string} roomId Associated room ID.
-   * @param {string} note Note content.
-   * @throws {Error} If validation fails.
-   */
-  public setRoomNote(roomId: RoomId | string, note: RoomNote | string): void {
-    const cleanRoomId = validateRoomId(roomId);
-    const cleanNote = validateRoomNote(note);
-    if (cleanNote) {
-      this.roomNotes.set(cleanRoomId, cleanNote);
-    } else {
-      this.roomNotes.delete(cleanRoomId);
-    }
-  }
-
-  /**
-   * Gets the local client-side note for a room.
-   *
-   * @param {string} roomId Associated room ID.
-   * @returns {string} The cached note content or empty string.
-   * @throws {Error} If validation fails.
-   */
-  public getRoomNote(roomId: RoomId | string): RoomNote {
-    const cleanRoomId = validateRoomId(roomId);
-    return this.roomNotes.get(cleanRoomId) || '' as RoomNote;
-  }
-
-  /**
-   * Finds all rooms shared between the selfbot user and another user.
-   *
-   * @param {string} username The target username.
-   * @returns {Room[]} Shared room instances array.
-   */
-  public mutualRoomsWith(username: Username | string): Room[] {
-    const target = username.trim().toLowerCase();
-    const me = this.username.trim().toLowerCase();
-    if (!target || !me) return [];
-
-    const matches: Room[] = [];
-    for (const room of this.rooms.values()) {
-      const members = room.members.map(m => m.trim().toLowerCase());
-      if (members.includes(me) && members.includes(target)) {
-        matches.push(room);
-      }
-    }
-    return matches;
-  }
-
-  /**
-   * Retrieves the cached user profile for a user.
-   *
-   * @param {string} username The username.
-   * @returns {Record<string, unknown> | null} The cached profile object or null.
-   */
-  public getUserProfile(username: Username | string): APIProfile | null {
-    const key = username.trim().toLowerCase() as Username;
-    return this.profilesByUser.get(key) || null;
-  }
-
-  /**
-   * Retrieves the list of cached members for a room.
-   *
-   * @param {string} roomId Associated room ID.
-   * @returns {string[]} List of cached member usernames.
-   * @throws {Error} If validation fails.
-   */
-  public getRoomMembers(roomId: RoomId | string): Username[] {
-    const cleanRoomId = validateRoomId(roomId);
-    const room = this.rooms.get(cleanRoomId);
-    if (room) return room.members;
-    return this.usersByRoom.get(cleanRoomId) || [];
-  }
-
-  /**
-   * Exports a full JSON-serializable snapshot of the client state, including rooms, keys, and notes.
-   *
-   * @returns {string} JSON-serialized backup string.
-   */
-  public exportSnapshot(): string {
-    const snapshot = {
-      version: 5,
-      exportedAt: new Date().toISOString(),
-      username: this.username,
-      status: this.status,
-      rooms: Array.from(this.rooms.values()).map(r => ({
-        roomId: r.roomId,
-        title: r.title,
-        iconUrl: r.iconUrl,
-        members: r.members,
-        lastPreview: r.lastPreview,
-        lastTimestamp: r.lastTimestamp,
-        lastSender: r.lastSender
-      })),
-      roomKeys: Array.from(this.roomKeys.entries()),
-      roomRatchets: Array.from(this.roomRatchets.entries()),
-      roomNotes: Array.from(this.roomNotes.entries()),
-      deleteMessagesOnLeave: this.deleteMessagesOnLeave,
-      serverClearsLocalMessages: this.serverClearsLocalMessages
-    };
-    return JSON.stringify(snapshot, null, 2);
-  }
-
-  /**
-   * Imports a client snapshot, updating rooms, keys, and notes.
-   *
-   * @param {string} json Backup configuration string.
-   * @throws {Error} If JSON parsing fails.
-   */
-  public importSnapshot(json: string): void {
-    const data = JSON.parse(json);
-    if (data.username) this.username = data.username;
-    if (data.status) this.status = data.status;
-    if (data.deleteMessagesOnLeave !== undefined) this.deleteMessagesOnLeave = data.deleteMessagesOnLeave;
-    if (data.serverClearsLocalMessages !== undefined) this.serverClearsLocalMessages = data.serverClearsLocalMessages;
-
-    if (Array.isArray(data.roomKeys)) {
-      for (const [roomId, key] of data.roomKeys) {
-        this.roomKeys.set(roomId, key);
-      }
-    }
-    if (Array.isArray(data.roomNotes)) {
-      for (const [roomId, note] of data.roomNotes) {
-        this.roomNotes.set(roomId, note);
-      }
-    }
-    if (Array.isArray(data.roomRatchets)) {
-      for (const [roomId, ratchet] of data.roomRatchets) {
-        this.roomRatchets.set(roomId, ratchet);
-      }
-    }
-    if (Array.isArray(data.rooms)) {
-      for (const r of data.rooms) {
-        const room = new Room(
-          this,
-          r.roomId,
-          r.title,
-          r.iconUrl,
-          r.members,
-          r.lastPreview,
-          r.lastTimestamp,
-          r.lastSender
-        );
-        this.rooms.set(r.roomId, room);
-        if (!this.activeRoomsList.includes(r.roomId)) {
-          this.activeRoomsList.push(r.roomId);
-        }
-      }
-    }
-  }
-
-  /**
-   * Loads the admin overview stats and lists. Requires admin status.
-   *
-   * @returns {Promise<Record<string, unknown>>} Admin analytics payload.
-   * @throws {Error} If account does not have admin privileges.
-   */
-  public async loadAdminOverview(): Promise<Record<string, unknown>> {
-    if (!this.isAdmin) throw new Error("QXChat Admin Error: Account does not have admin privileges.");
-    return this._apiRequest('/api/admin/overview');
-  }
-
-  /**
-   * Toggles a global server feature. Requires admin status.
-   *
-   * @param {string} key Feature code identifier.
-   * @param {boolean} enabled Status flag.
-   * @returns {Promise<Record<string, unknown>>} Action status response.
-   * @throws {Error} If account does not have admin privileges.
-   */
-  public async setAdminFeature(key: string, enabled: boolean): Promise<Record<string, unknown>> {
-    if (!this.isAdmin) throw new Error("QXChat Admin Error: Account does not have admin privileges.");
-    return this._apiRequest('/api/admin/features', {
-      method: 'POST',
-      body: JSON.stringify({ key, enabled: Boolean(enabled) })
-    });
-  }
-
-  /**
-   * Disables or enables a user account. Requires admin status.
-   *
-   * @param {string} userId UUID of target user account.
-   * @param {boolean} disabled Disables if true, enables if false.
-   * @returns {Promise<Record<string, unknown>>} Action response.
-   * @throws {Error} If account does not have admin privileges.
-   */
-  public async setAdminUserDisabled(userId: string, disabled: boolean): Promise<Record<string, unknown>> {
-    if (!this.isAdmin) throw new Error("QXChat Admin Error: Account does not have admin privileges.");
-    return this._apiRequest(`/api/admin/users/${encodeURIComponent(userId)}/disabled`, {
-      method: 'POST',
-      body: JSON.stringify({ disabled: Boolean(disabled) })
-    });
-  }
-
-  /**
-   * Bans or unbans a user account. Requires admin status.
-   *
-   * @param {string} userId UUID of target user account.
-   * @param {boolean} banned Bans if true, unbans if false.
-   * @returns {Promise<Record<string, unknown>>} Action response.
-   * @throws {Error} If account does not have admin privileges.
-   */
-  public async setAdminUserBanned(userId: string, banned: boolean): Promise<Record<string, unknown>> {
-    if (!this.isAdmin) throw new Error("QXChat Admin Error: Account does not have admin privileges.");
-    return this._apiRequest(`/api/admin/users/${encodeURIComponent(userId)}/banned`, {
-      method: 'POST',
-      body: JSON.stringify({ banned: Boolean(banned) })
-    });
-  }
 }
-

@@ -5,7 +5,8 @@ import {
   validateBannerSize,
   type ProfileDescription,
   type Pronouns,
-} from '@errors';
+} from '../errors';
+import { BaseBuilder } from './BaseBuilder';
 
 export interface ProfileImagePayload {
   id?: string;
@@ -26,8 +27,9 @@ export interface ProfilePayload {
 
 /**
  * Fluent builder for user profile updates.
+ * Extends BaseBuilder to enforce the serialization contract.
  */
-export class ProfileBuilder {
+export class ProfileBuilder extends BaseBuilder<ProfilePayload> {
   private _avatar: ProfileImagePayload | null = null;
   private _banner: ProfileImagePayload | null = null;
   private _description: ProfileDescription = '' as ProfileDescription;
@@ -82,18 +84,12 @@ export class ProfileBuilder {
 
     validateAvatarSize(computedSize);
 
-    this._avatar = {
-      mimeType,
-      size: computedSize,
-      width,
-      height,
-      dataB64: rawB64,
-    };
+    this._avatar = { mimeType, size: computedSize, width, height, dataB64: rawB64 };
     return this;
   }
 
   /**
-   * Sets a remote URL as the avatar (typically when importing from backup).
+   * Sets a remote URL as the avatar (e.g. when importing from a backup).
    *
    * @param {string} url Remote web URL.
    * @param {string} [mimeType='image/jpeg'] MIME type.
@@ -103,20 +99,13 @@ export class ProfileBuilder {
    * @returns {this} This builder instance for chaining.
    */
   setRemoteAvatar(url: string, mimeType = 'image/jpeg', id?: string, width = 0, height = 0): this {
-    this._avatar = {
-      id: id || undefined,
-      url,
-      mimeType,
-      size: 0,
-      width,
-      height,
-    };
+    this._avatar = { id: id || undefined, url, mimeType, size: 0, width, height };
     return this;
   }
 
   /**
-   * Clears the current avatar configurations.
-   * 
+   * Clears the current avatar configuration.
+   *
    * @returns {this} This builder instance for chaining.
    */
   clearAvatar(): this {
@@ -129,7 +118,7 @@ export class ProfileBuilder {
    *
    * @param {string} dataB64 Base64-encoded image data.
    * @param {string} mimeType MIME type (e.g. image/png, image/jpeg).
-   * @param {number} [sizeBytes] Optional banner size in bytes. If omitted, it is derived from base64.
+   * @param {number} [sizeBytes] Optional banner size in bytes. If omitted, derived from base64.
    * @param {number} [width=0] Optional banner width.
    * @param {number} [height=0] Optional banner height.
    * @returns {this} This builder instance for chaining.
@@ -147,13 +136,7 @@ export class ProfileBuilder {
 
     validateBannerSize(computedSize);
 
-    this._banner = {
-      mimeType,
-      size: computedSize,
-      width,
-      height,
-      dataB64: rawB64,
-    };
+    this._banner = { mimeType, size: computedSize, width, height, dataB64: rawB64 };
     return this;
   }
 
@@ -168,20 +151,13 @@ export class ProfileBuilder {
    * @returns {this} This builder instance for chaining.
    */
   setRemoteBanner(url: string, mimeType = 'image/jpeg', id?: string, width = 0, height = 0): this {
-    this._banner = {
-      id: id || undefined,
-      url,
-      mimeType,
-      size: 0,
-      width,
-      height,
-    };
+    this._banner = { id: id || undefined, url, mimeType, size: 0, width, height };
     return this;
   }
 
   /**
    * Clears the current banner configuration.
-   * 
+   *
    * @returns {this} This builder instance for chaining.
    */
   clearBanner(): this {
@@ -191,10 +167,10 @@ export class ProfileBuilder {
 
   /**
    * Serializes the profile configuration to the QXChat server payload representation.
-   * 
+   *
    * @returns {ProfilePayload} Serializable user profile updates payload.
    */
-  toJSON(): ProfilePayload {
+  override toJSON(): ProfilePayload {
     return {
       avatar: this._avatar,
       banner: this._banner,

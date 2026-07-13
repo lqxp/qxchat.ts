@@ -1,21 +1,30 @@
-import { validateMessageText, validateAttachmentSize, type MessageText, type RoomId } from '@errors';
-import { encryptRoomPayload } from '@crypto';
-import type { APIAttachment, EncryptedEnvelope } from '@types';
+import { validateMessageText, validateAttachmentSize, type MessageText, type RoomId } from '../errors';
+import { encryptRoomPayload } from '../crypto/e2ee';
+import type { APIAttachment, EncryptedEnvelope } from '../types';
+import { BaseBuilder } from './BaseBuilder';
+
+export interface MessagePayload {
+  text: MessageText;
+  attachment: APIAttachment | null;
+  replyToMessageId: string | null;
+}
 
 /**
- * Fluent builder for constructing E2EE message payloads.
+ * Fluent builder for constructing E2EE-capable message payloads.
+ * Extends BaseBuilder to enforce the serialization contract.
  */
-export class MessageBuilder {
+export class MessageBuilder extends BaseBuilder<MessagePayload> {
   private _text: MessageText = '' as MessageText;
   private _replyToMessageId: string | null = null;
   private _attachment: APIAttachment | null = null;
 
   /**
    * Creates a new MessageBuilder.
-   * 
+   *
    * @param {string} [initialText] Optional initial message text content.
    */
   constructor(initialText?: string) {
+    super();
     if (initialText !== undefined) {
       this.setText(initialText);
     }
@@ -36,7 +45,7 @@ export class MessageBuilder {
 
   /**
    * Retrieves the current text content of the message.
-   * 
+   *
    * @returns {MessageText} The text content.
    */
   get text(): MessageText {
@@ -56,7 +65,7 @@ export class MessageBuilder {
 
   /**
    * Retrieves the reply message ID target.
-   * 
+   *
    * @returns {string | null} The target message ID or null.
    */
   get replyToMessageId(): string | null {
@@ -96,7 +105,7 @@ export class MessageBuilder {
 
   /**
    * Clears any active attachment on this message.
-   * 
+   *
    * @returns {this} This builder instance for chaining.
    */
   clearAttachment(): this {
@@ -106,7 +115,7 @@ export class MessageBuilder {
 
   /**
    * Retrieves the active attachment config.
-   * 
+   *
    * @returns {APIAttachment | null} The attachment or null.
    */
   get attachment(): APIAttachment | null {
@@ -114,11 +123,11 @@ export class MessageBuilder {
   }
 
   /**
-   * Converts the builder configuration to a plain text representation.
-   * 
-   * @returns {{ text: MessageText; attachment: APIAttachment | null; replyToMessageId: string | null }} Serializable object.
+   * Serializes the builder configuration to a plain message payload object.
+   *
+   * @returns {MessagePayload} Serializable message payload.
    */
-  toJSON(): { text: MessageText; attachment: APIAttachment | null; replyToMessageId: string | null } {
+  override toJSON(): MessagePayload {
     return {
       text: this._text,
       attachment: this._attachment,
@@ -136,7 +145,6 @@ export class MessageBuilder {
    * @throws {Error} If verification or encryption fails.
    */
   async toEncrypted(roomKey: string, roomId: RoomId, counter?: number): Promise<EncryptedEnvelope> {
-    const payload = this.toJSON();
-    return encryptRoomPayload(roomKey, roomId, payload, counter);
+    return encryptRoomPayload(roomKey, roomId, this.toJSON(), counter);
   }
 }

@@ -68,7 +68,7 @@ function base64ToBytes(base64: string): Uint8Array {
 }
 
 function strictBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return bytes.buffer as ArrayBuffer;
 }
 
 export function encodeBase64Url(bytes: Uint8Array): string {
@@ -153,16 +153,22 @@ export function parseRoomAccessToken(rawValue: string): { token: string; roomId:
   };
 }
 
+const hkdfKeysCache = new Map<string, CryptoKey>();
+
 async function deriveMessageKey(roomKey: string, roomId: string, salt: Uint8Array, counter: number): Promise<CryptoKey> {
-  const raw = hexToBytes(roomKey);
-  if (raw.length !== ROOM_KEY_BYTES) throw new Error("QXChat: Invalid room key length.");
-  const baseKey = await crypto.subtle.importKey(
-    "raw",
-    strictBuffer(raw),
-    "HKDF",
-    false,
-    ["deriveKey"]
-  );
+  let baseKey = hkdfKeysCache.get(roomKey);
+  if (!baseKey) {
+    const raw = hexToBytes(roomKey);
+    if (raw.length !== ROOM_KEY_BYTES) throw new Error("QXChat: Invalid room key length.");
+    baseKey = await crypto.subtle.importKey(
+      "raw",
+      strictBuffer(raw),
+      "HKDF",
+      false,
+      ["deriveKey"]
+    );
+    hkdfKeysCache.set(roomKey, baseKey);
+  }
   const info = TEXT_ENCODER.encode(`qxchat:e2ee:v2:${roomId}:${counter}`);
   return crypto.subtle.deriveKey(
     { name: "HKDF", hash: "SHA-256", salt: strictBuffer(salt), info: strictBuffer(info) },
@@ -170,16 +176,6 @@ async function deriveMessageKey(roomKey: string, roomId: string, salt: Uint8Arra
     { name: "AES-GCM", length: 256 },
     false,
     ["encrypt", "decrypt"]
-  );
-}
-
-async function importDevicePrivateKey(privateKey: JsonWebKey): Promise<CryptoKey> {
-  return crypto.subtle.importKey(
-    "jwk",
-    privateKey,
-    { name: "ECDSA", namedCurve: "P-256" },
-    false,
-    ["sign"]
   );
 }
 
@@ -193,7 +189,7 @@ async function importDevicePublicKey(publicKey: JsonWebKey): Promise<CryptoKey> 
   );
 }
 
-function signingPayload(envelope: any): Uint8Array {
+function signingPayload(envelope: EncryptedEnvelope): Uint8Array {
   return TEXT_ENCODER.encode(JSON.stringify({
     v: envelope.v,
     alg: envelope.alg,
@@ -207,7 +203,13 @@ function signingPayload(envelope: any): Uint8Array {
   }));
 }
 
-let activeSigner: { deviceId: string; publicKey: JsonWebKey; privateKey: JsonWebKey } | null = null;
+let activeSigner: {
+  deviceId: string;
+  publicKey: JsonWebKey;
+  privateKey: JsonWebKey;
+  privateCryptoKey: CryptoKey;
+  publicCryptoKey: CryptoKey;
+} | null = null;
 
 async function getSigner() {
   if (!activeSigner) {
@@ -222,9 +224,15 @@ async function getSigner() {
     );
     const publicKey = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
     const privateKey = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
-    activeSigner = { deviceId, publicKey, privateKey };
+    activeSigner = {
+      deviceId,
+      publicKey: publicKey as JsonWebKey,
+      privateKey: privateKey as JsonWebKey,
+      privateCryptoKey: keyPair.privateKey,
+      publicCryptoKey: keyPair.publicKey,
+    };
   }
-  return activeSigner;
+  return activeSigner!;
 }
 
 /**
@@ -302,7 +310,7 @@ export async function encryptRoomPayload(
     senderSigningKey: signer.publicKey
   };
 
-  const privateKey = await importDevicePrivateKey(signer.privateKey);
+  const privateKey = signer.privateCryptoKey;
   const signature = await crypto.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },
     privateKey,
@@ -310,7 +318,7 @@ export async function encryptRoomPayload(
   );
   envelope.signature = encodeBase64Url(new Uint8Array(signature));
 
-  return envelope as EncryptedEnvelope;
+  return envelope;
 }
 
 /**

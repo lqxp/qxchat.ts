@@ -25,11 +25,16 @@
     "baseUrl": "./",
     "paths": {
       "@client/*": ["src/client/*"],
+      "@structures": ["src/structures/index.ts"],
+      "@structures/*": ["src/structures/*"],
       "@builders": ["src/builders/index.ts"],
+      "@builders/*": ["src/builders/*"],
       "@crypto": ["src/crypto/e2ee.ts"],
       "@types": ["src/types/index.ts"],
+      "@types/*": ["src/types/*"],
       "@errors": ["src/errors/limits.ts"],
-      "@websocket": ["src/client/SelfbotClient.ts"]
+      "@websocket": ["src/client/SelfbotClient.ts"],
+      "@constants": ["src/constants.ts"]
     },
 
     // Some stricter flags (disabled by default)
